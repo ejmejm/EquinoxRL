@@ -1,0 +1,22 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Egg info
+*.egg-info/
+
+# Logs and outputs
+outputs/
+
+# Hydra outputs
+.hydra/
+
+# IDE settings
+.vscode/
+.idea/
+
+discovery.egg-info/
+
