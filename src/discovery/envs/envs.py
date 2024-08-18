@@ -1,4 +1,6 @@
+import gymnasium as gym
 from omegaconf import DictConfig
+from ray.rllib.env.vector_env import VectorEnv
 
 from .equinox_env import EquinoxEnv, XMinigridEqxEnv
 from discovery.utils import tree_replace
@@ -25,6 +27,7 @@ def resolve_xminigrid_wrapper(name: str):
 
 def create_env(env_config: DictConfig) -> EquinoxEnv:
     """Higher level function to create an environment from a config."""
+    disable_jit = env_config.get('disable_jit', False)
 
     if env_config.type.lower() == 'xminigrid':
         import xminigrid
@@ -33,14 +36,16 @@ def create_env(env_config: DictConfig) -> EquinoxEnv:
             wrapper_class = resolve_xminigrid_wrapper(wrapper_name)
             env = wrapper_class(env)
         env = XMinigridEqxEnv(env, env_params)
+        
+    elif env_config.type.lower() == 'gymnasium':
+        pass
+        # env = VectorEnv()
+        # env = gym.make(env_config.name)
 
     else:
         raise ValueError(
             f"Invalid environment type: {env_config.type}"
             f"Supported types: {VALID_ENV_TYPES}"
         )
-        
-    if env_config.get('disable_jit', False):
-        env = tree_replace(env, jittable=False)
-    
+
     return env

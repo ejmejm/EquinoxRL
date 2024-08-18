@@ -4,8 +4,7 @@ cache_jit: True
 
 train:
   steps: 1_000_000  # In number of environment steps
-  tbptt_window: 20
-  per_env_batch_size: 16
+  per_env_batch_size: 64
   log_interval: 10_000 # In number of environment steps
 
 model:
@@ -22,10 +21,9 @@ optimizer:
   learning_rate: 3e-4
 
 env:
-  # disable_jit: True
-  n_envs: 1
+  n_envs: 8
   type: "xminigrid" # Valid options: "xminigrid"
-  name: "MiniGrid-Empty-6x6"
+  name: "MiniGrid-Empty-5x5"
   wrappers:
     - "DmEnvAutoResetWrapper"
     - "RGBImgObservationWrapper"

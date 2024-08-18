@@ -140,3 +140,49 @@ try:
 
 except ImportError:
     pass
+
+
+##### Gymnasium #####
+
+
+try:
+    from ray.rllib.env.vector_env import VectorEnv as RLLibVectorEnv
+
+    class VectorizedEqxEnv(EquinoxEnv):
+        """Wraps and vecotizes gymnasium environments."""
+        jittable: bool = eqx.field(static=True, default=False)
+        env: XMEnvironment = eqx.field(static=True)
+        env_params: XMEnvParams = eqx.field(static=True)
+
+        def __init__(self, env: XMEnvironment, env_params: XMEnvParams):
+            self.env = env
+            self.env_params = env_params
+
+        def reset(self, rng: PRNGKeyArray):
+            env_state = self.env.reset(self.env_params, rng)
+            return env_state, env_state.observation
+
+        def step(self, env_state: XMTimeStep, action: int):
+            env_state = self.env.step(self.env_params, env_state, action=action)
+            return env_state, env_state.observation, env_state.reward, env_state.last(), {}
+
+        @property
+        def observation_space(self):
+            return self.env.observation_shape(self.env_params)
+
+        @property
+        def action_space(self):
+            return self.env.num_actions(self.env_params)
+        
+        @property
+        def num_actions(self):
+            return self.env.num_actions(self.env_params)
+
+        def render(self):
+            return self.env.render(self.env_params, self.timestep)
+
+        def __getattr__(self, name):
+            return getattr(self.env, name)
+
+except ImportError:
+    pass

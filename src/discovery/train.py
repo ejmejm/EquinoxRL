@@ -7,6 +7,7 @@ from typing import Callable, NamedTuple, Tuple
 import equinox as eqx
 import hydra
 import jax
+import jax.nn as jnn
 import jax.numpy as jnp
 from jax.experimental.compilation_cache import compilation_cache
 from jaxtyping import ArrayLike, PRNGKeyArray, PyTree
@@ -18,7 +19,7 @@ from tqdm import tqdm
 from envs.envs import create_env
 from envs.equinox_env import EquinoxEnv
 from models import ActorCriticModel, get_feature_extractor_cls, get_activation_fn
-from training import TrainState, TrajectoryData, apply_grads
+from training import apply_grads, compute_reinforce_grads, TrainState, TrajectoryData
 from utils import tree_replace
 
 
@@ -68,12 +69,6 @@ def create_optimizer(
     return optimizer, opt_state
 
 
-# Gather data
-# Calculate losses
-# Calculate gradients
-# Update model
-
-
 def gather_data(
         key: PRNGKeyArray,
         env_state_and_obs: Tuple[PyTree, PyTree],
@@ -84,31 +79,33 @@ def gather_data(
         half_precision: bool = False,
     ) -> Tuple[Tuple[PyTree, PyTree], TrajectoryData]:
     def predict_and_step_fn(state, _):
-        env_state, obs = state
+        (env_state, obs), rng = state
+        act_key, random_key, act_mask_key, rng = jax.random.split(rng, 4)
             
         act_logits, value = forward_fn(model, obs)
-        action = jax.random.categorical(key, act_logits, axis=-1)
+        model_action = jax.random.categorical(act_key, act_logits, axis=-1)
+        
+        # 10% chance of taking random action
+        random_action = jax.random.randint(random_key, shape=model_action.shape, minval=0, maxval=act_logits.shape[-1])
+        random_mask = jax.random.uniform(act_mask_key, shape=model_action.shape) < 0.1
+        action = jnp.where(random_mask, random_action, model_action)
+        action = model_action
         
         env_state, new_obs, reward, done, info = env_step_fn(env_state, action)
-        print(new_obs.shape, reward, done, info)
         if half_precision:
             new_obs = new_obs.astype(jnp.bfloat16)
             reward = reward.astype(jnp.bfloat16)
+            done = done.astype(jnp.bfloat16)
         
-        return (env_state, new_obs), TrajectoryData(obs, action, new_obs, reward, done, value, info)
+        return ((env_state, new_obs), rng), TrajectoryData(obs, action, new_obs, reward, done, value, info)
     
     # TODO: Add support for non-jittable env step fn with a for loop
-    env_state_and_obs, train_sequences = jax.lax.scan(
-        predict_and_step_fn, env_state_and_obs, length=rollout_length)
+    scan_state = (env_state_and_obs, key)
+    scan_state, train_sequences = jax.lax.scan(
+        predict_and_step_fn, scan_state, length=rollout_length)
+    env_state_and_obs = scan_state[0]
 
     return env_state_and_obs, train_sequences
-
-
-# def gen_summary_metrics(
-#         metrics: Dict[str, float],
-#         prefix: str = '',
-#     ) -> Dict[str, float]:
-#     return {f'{prefix}_{k}': v for k, v in metrics.items()}
 
 
 @partial(jax.jit, static_argnums=(3,))
@@ -119,48 +116,12 @@ def batch_train_iter(
         train_config: DictConfig,
     ):
     # Trajectory data element shapes: (rollout_length, n_envs, ...) -> (n_envs, rollout_length, ...)
-    trajectory_data = jax.tree.map(jnp.transpose, trajectory_data)
+    trajectory_data = jax.tree.map(partial(jnp.swapaxes, axis1=0, axis2=1), trajectory_data)
 
-    # policy_grads, policy_metrics = train_reinforce_step(
-    #     train_state: TrainState,
-    #     model: ActorCriticModel,
-    #     obs: Array,
-    #     action: Array,
-    #     reward: Array,
-    # )
-
-    # value_grads, value_metrics = train_value_fn_step(
-    #     train_state: TrainState,
-    #     model: eqx.Module,
-    #     obs: Array,
-    #     reward: Array,
-    #     done: Array,
-    # )
-
-    # # batch_loss_and_grads = jax.vmap(supervised_loss_and_grads, (None, 0, 0))
-    # # losses, grads, accuracies, rnn_states = batch_loss_and_grads(model, rnn_states, train_sequences)
-    # # loss = jnp.mean(losses)
-    # # accuracy = jnp.mean(accuracies)
-    # metrics = {
-    #     **{f'policy/{k}': v for k, v in policy_metrics.items()},
-    #     **{f'value/{k}': v for k, v in value_metrics.items()},
-    # }
-    
-    # grads_sum = jnp.zeros_like(policy_grads)
-    # for grads in [policy_grads, value_grads]:
-    #     grads = jax.tree.map(lambda x: jnp.mean(x, axis=0), grads) # Average over gradients
-    #     grads_sum += grads
-    
-    # train_state, model = apply_grads(
-    #     train_state,
-    #     model,
-    #     grads_sum,
-    # )
-
-    # # Update train state
-    # train_state = tree_replace(train_state, train_step=train_state.train_step + 1)
-
-    metrics = {'loss': jnp.array([0.0, 1.0])}
+    # Compute gradients and update model
+    grads, metrics = compute_reinforce_grads(train_state, model, trajectory_data)
+    train_state, model = apply_grads(train_state, model, grads)
+    train_state = tree_replace(train_state, train_step=train_state.train_step + 1)
 
     return train_state, model, metrics
 
@@ -250,6 +211,7 @@ def train(
             )
 
             avg_loss = jnp.nanmean(metrics['loss'])
+            avg_reward = jnp.nanmean(metrics['avg_reward'])
 
             if jnp.isnan(avg_loss):
                 print('Loss is nan, breakpoint!')
@@ -259,6 +221,7 @@ def train(
 
             pbar.update(steps_per_log * effective_batch_size)
             pbar.set_postfix({
+                'avg_reward': avg_reward,
                 'avg_loss': avg_loss,
                 'train_steps': train_steps_passed,
                 'env_steps': env_steps_passed
@@ -319,8 +282,6 @@ def main(config: DictConfig) -> None:
 
     # Prepare optimizer
     optimizer, opt_state = create_optimizer(model, config.optimizer)
-    
-    print(optimizer)
 
 
     # Train

@@ -125,7 +125,7 @@ class ActorCriticModel(eqx.Module):
         self.action_dim = action_dim
         self.activation_fn = activation_fn or jax.nn.gelu
 
-        gen_keys = jax.random.split(key, 3)
+        gen_keys = jax.random.split(key, 4)
         input_dim = feature_extractor.output_dim
         self.actor = nn.Sequential(make_mlp(
             key = gen_keys[0],
@@ -137,6 +137,11 @@ class ActorCriticModel(eqx.Module):
             layer_sizes = [input_dim] + list(critic_layer_sizes) + [1],
             activation_fn = activation_fn,
         ))
+        
+    def _init_weights(self, key: PRNGKeyArray):
+        # Initialize final layer of actor and critic weights to be 0s
+        self.actor[-1].weight = jnp.zeros_like(self.actor[-1].weight)
+        self.critic[-1].weight = jnp.zeros_like(self.critic[-1].weight)
 
     def __call__(self, x: Array, *, key: Optional[PRNGKeyArray] = None) -> Tuple[Array, Array]:
         z = self.feature_extractor(x)
