@@ -108,12 +108,11 @@ def gather_data(
     return env_state_and_obs, train_sequences
 
 
-@partial(jax.jit, static_argnums=(3,))
+@jax.jit
 def batch_train_iter(
         train_state: TrainState,
         model: eqx.Module,
         trajectory_data: TrajectoryData,
-        train_config: DictConfig,
     ):
     # Trajectory data element shapes: (rollout_length, n_envs, ...) -> (n_envs, rollout_length, ...)
     trajectory_data = jax.tree.map(partial(jnp.swapaxes, axis1=0, axis2=1), trajectory_data)
@@ -131,7 +130,6 @@ def train_loop(
         env_state_and_obs: Tuple[PyTree, PyTree], # (env_state, obs)
         model: eqx.Module,
         env_step_fn: Callable,
-        train_config: DictConfig,
         train_steps: int,
         half_precision: bool = False,
     ):
@@ -148,12 +146,12 @@ def train_loop(
         # Gather data
         env_state_and_obs, trajectory_data = gather_data(
             rollout_key, env_state_and_obs, env_step_fn, model, rollout_forward_fn,
-            train_config.per_env_batch_size, half_precision,
+            train_state.config.per_env_batch_size, half_precision,
         )
 
         # Train on data
         train_state, model, metrics = batch_train_iter(
-            train_state, model, trajectory_data, train_config)
+            train_state, model, trajectory_data)
 
         return (train_state, env_state_and_obs, model), metrics
 
@@ -181,7 +179,7 @@ def train(
     # If the env is jittable, we can jit the entire train loop
     _train_loop = train_loop
     if env.jittable:
-        _train_loop = jax.jit(train_loop, static_argnums=(3, 4, 5, 6))
+        _train_loop = jax.jit(train_loop, static_argnums=(3, 4, 5))
     
     # If there are multiple environments, I need to make sure that the model forward fn for rollouts can handle multiple obs
     # If the env is not jittable, and hence the data collection loop is not jittable, I need to make sure that the same function is also jitted
@@ -206,9 +204,7 @@ def train(
     with tqdm(total=train_config.steps) as pbar:
         for _ in range(total_steps // steps_per_log):
             train_state, env_state_and_obs, model, metrics = _train_loop(
-                train_state, env_state_and_obs, model, env_step_fn,
-                train_config, steps_per_log, half_precision,
-            )
+                train_state, env_state_and_obs, model, env_step_fn, steps_per_log, half_precision)
 
             avg_loss = jnp.nanmean(metrics['loss'])
             avg_reward = jnp.nanmean(metrics['avg_reward'])
@@ -285,7 +281,7 @@ def main(config: DictConfig) -> None:
 
 
     # Train
-    train_state = TrainState(rng, opt_state, optimizer.update)
+    train_state = TrainState(rng, opt_state, optimizer.update, config.train)
     train(env_key, train_state, env, model, config)
 
 

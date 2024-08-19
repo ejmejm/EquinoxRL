@@ -32,17 +32,46 @@ class TrainState(eqx.Module):
     opt_state: optax.OptState
     train_step: Array
     tx_update_fn: Callable = eqx.field(static=True)
+    config: Dict = eqx.field(static=True) # Train config
 
     def __init__(
             self,
             rng: PRNGKeyArray,
             opt_state: optax.OptState,
             tx_update_fn: Callable,
+            config: Dict,
         ):
         self.rng = rng
         self.opt_state = opt_state
         self.tx_update_fn = tx_update_fn
         self.train_step = jnp.array(0)
+        self.config = config
+
+
+def calculate_gaes(trajectory_data: TrajectoryData, gamma: float, lambda_decay: float) -> Array:
+    """Calculate the Generalized Advantage Estimation (GAE) for a trajectory.
+    
+    Args:
+        trajectory_data: The trajectory with elements of shape (n_envs, rollout_len, ...).
+        gamma: The discount factor.
+        lambda_decay: The decay factor.
+
+    Returns:
+        An array of GAE values of shape (n_envs, rollout_len).
+    """
+    rewards = trajectory_data.reward
+    dones = trajectory_data.done
+    values = trajectory_data.value
+    
+    deltas = rewards + (1 - dones) * gamma * values[:, 1:] - values[:, :-1]
+    
+    def calc_gae(gae, delta):
+        gae = delta + lambda_decay * gamma * gae
+        return gae, gae
+    
+    _, gaes = jax.lax.scan(jax.vmap(calc_gae), jnp.zeros_like(deltas[:, 0]), deltas.T, reverse=True)
+
+    return gaes.T
 
 
 def compute_reinforce_grads(
@@ -65,27 +94,18 @@ def compute_reinforce_grads(
     if target_model is not None:
         raise NotImplementedError('Target model not implemented')
     
-    gamma = 0.98
+    gamma = train_state.config['gamma']
+    lambda_decay = train_state.config['lambda_decay']
     
     final_obs = trajectory_data.new_obs[:, -1]
     final_values = jax.vmap(model.value)(final_obs)
-    rewards = trajectory_data.reward
-    dones = trajectory_data.done.astype(jnp.bool_)
+    all_values = jnp.concatenate([trajectory_data.value, final_values[:, None]], axis=1)
+    trajectory_data = tree_replace(trajectory_data, value=all_values)
+    print(trajectory_data.value)
     
-    # returns = jax.stack([returns, final_values[:, None]], axis=-1)
-    # TODO: Check if I can do this with an associative scan
-    # It wouldn't be a huge performance boost, but I do want to learn how to use associative scans
-    def discounted_return_fn(next_vals, x):
-        rewards, dones = x
-        return_vals = rewards + (1 - dones) * gamma * next_vals
-        return return_vals, return_vals
-    
-    # (2, n_envs, rollout_len) -> (rollout_len[reversed], 2, n_envs)
-    reward_and_dones = jnp.stack([rewards, dones]).transpose(2, 0, 1)[::-1]
-    _, returns = jax.lax.scan(discounted_return_fn, final_values, reward_and_dones)
-    returns = returns[::-1].transpose() # -> (n_envs, rollout_len)
+    gaes = calculate_gaes(trajectory_data, gamma, lambda_decay)
 
-    def reinforce_loss_fn(model, returns, obs, acts):
+    def reinforce_loss_fn(model, gaes, obs, acts):
         act_logits, values = jax.vmap(model)(obs)
         
         # Gather the log probs of the actions
@@ -93,8 +113,8 @@ def compute_reinforce_grads(
         act_log_probs = jnp.take_along_axis(log_probs, acts[:, None], axis=1).squeeze(1)
         
         # Calculate losses
-        td_error = returns - values
-        policy_loss = -jnp.mean(act_log_probs * jax.lax.stop_gradient(td_error))
+        td_error = gaes + jax.lax.stop_gradient(values) - values
+        policy_loss = -jnp.mean(act_log_probs * gaes)
         value_loss = jnp.mean(td_error ** 2)
         
         # Total loss
@@ -108,11 +128,11 @@ def compute_reinforce_grads(
 
     grad_fn = jax.grad(reinforce_loss_fn, has_aux=True)
 
-    flat_returns = returns.flatten()
+    flat_gaes = gaes.flatten()
     flat_obs = trajectory_data.obs.reshape((-1,) + trajectory_data.obs.shape[2:])
     flat_acts = trajectory_data.action.flatten()
 
-    grads, loss_metrics = grad_fn(model, flat_returns, flat_obs, flat_acts)
+    grads, loss_metrics = grad_fn(model, flat_gaes, flat_obs, flat_acts)
     metrics = {
         **loss_metrics,
         'avg_reward': jnp.mean(trajectory_data.reward),
@@ -134,3 +154,30 @@ def apply_grads(
     train_state = tree_replace(train_state, opt_state=new_opt_state)
 
     return train_state, new_model
+
+
+if __name__ == '__main__':
+    # Test the GAE calculation
+    rewards = jnp.array([
+        [1.0, 0.0, 2.0, -1.0],
+        [0.5, 1.5, 0.0, 1.0]
+    ])
+    values = jnp.array([
+        [0.0, 0.0, 0.0, 0.0, 0.0],
+        [2.0, 1.5, 2.5, 1.0, 0.0]
+    ])
+    dones = jnp.array([
+        [0, 0, 0, 1],
+        [0, 1, 0, 0]
+    ])
+
+    trajectory_data = TrajectoryData(
+        obs=None, action=None, new_obs=None, reward=rewards,
+        done=dones, value=values, info=None,
+    )
+
+    gamma = 0.99
+    lambda_decay = 0.95
+
+    gaes = calculate_gaes(trajectory_data, gamma, lambda_decay)
+    print(gaes)
