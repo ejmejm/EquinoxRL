@@ -169,7 +169,7 @@ if __name__ == '__main__':
 
     gaes = calculate_gaes(trajectory_data, gamma, lambda_decay)
     print(gaes)
-    
+
 
 @jax.jit
 def batch_train_iter(

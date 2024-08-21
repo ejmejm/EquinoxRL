@@ -8,16 +8,18 @@ import hydra
 import jax
 import jax.numpy as jnp
 from jax.experimental.compilation_cache import compilation_cache
-from jaxtyping import PRNGKeyArray
+from jaxtyping import ArrayLike, PRNGKeyArray
+import numpy as np
 import omegaconf
 from omegaconf import DictConfig
 import optax
 from tqdm import tqdm
 
-from envs.envs import create_env
-from envs.base_env import BaseEnv, VectorizedGymLikeEnv
-from models import ActorCriticModel, get_feature_extractor_cls, get_activation_fn
-from training import train_loop, TrainState
+from discovery.envs.envs import create_env
+from discovery.envs.base_env import BaseEnv, VectorizedGymLikeEnv
+from discovery.evaluation import evaluate_agent
+from discovery.models import ActorCriticModel, get_feature_extractor_cls, get_activation_fn
+from discovery.training import train_loop, TrainState
 
 
 # jax.config.update("jax_debug_nans", True)
@@ -66,15 +68,40 @@ def create_optimizer(
     return optimizer, opt_state  
 
 
-def to_half_precision(x: jax.Array):
+def to_half_precision(x: jax.Array) -> jax.Array:
     """Convert array to bf16 if it's a full precision float."""
     if x.dtype == jnp.float32:
         return x.astype(jnp.bfloat16)
     return x
 
 
-def validate_config(config: DictConfig):
+def validate_config(config: DictConfig) -> None:
     pass
+
+
+def log_trajectories(trajectories: ArrayLike) -> None:
+    """Log trajectories to wandb.
+    
+    Args:
+        trajectories: A list of trajectories, each of shape (S, C, H, W).
+    """
+    import wandb
+    videos = []
+    for trajectory in trajectories:
+        video = (trajectory * 255).astype(np.uint8)
+        videos.append(wandb.Video(video, fps=4))
+    wandb.log({'eval/trajectory': videos})
+
+
+def log_training_metrics(config, log_metrics, train_config, trajectories):
+    if config.wandb.get('enabled', False):
+        import wandb
+        for k, v in log_metrics.items():
+            if isinstance(v, list):
+                log_metrics[k] = wandb.Histogram(v, num_bins=32)
+        wandb.log(log_metrics)
+        if train_config.get('log_trajectories', False) and trajectories is not None:
+            log_trajectories(trajectories)
 
 
 def train(
@@ -83,25 +110,32 @@ def train(
         env: BaseEnv,
         model: eqx.Module,
         config: DictConfig,
-    ):
+    ) -> None:
+    
+    ### Initialize training loop variables ###
+    
     train_config = config.train
     effective_batch_size = train_config.per_env_batch_size * config.env.n_envs
     steps_per_log = train_config.log_interval // effective_batch_size
     total_steps = train_config.steps // effective_batch_size
-    last_trajectory_log = 0
+    last_eval = 0
     
     env_steps_passed = 0
     train_steps_passed = 0
     
-    # If the env is jittable, we can jit the entire train loop
+    ### Jitting ###
+    
     _train_loop = train_loop
+    _eval_loop = evaluate_agent
     if env.jittable:
         _train_loop = jax.jit(train_loop, static_argnums=(3, 4, 5, 7))
+        _eval_loop = jax.jit(evaluate_agent, static_argnums=(3, 4))
     forward_fn = jax.jit(jax.vmap(type(model).__call__, in_axes=(None, 0)))
 
     half_precision = config.get('half_precision', False)
     
-    # Initialize the env state
+    ### Initialize the env states ###
+    
     if env.jittable:
         keys = jax.random.split(key, config.env.n_envs + 1)
         env_keys, key = keys[:-1], keys[-1]
@@ -118,39 +152,54 @@ def train(
     
     with tqdm(total=train_config.steps) as pbar:
         for _ in range(total_steps // steps_per_log):
-            train_state, env_state_and_obs, model, metrics = _train_loop(
+            
+            ### Train ###
+            
+            train_state, env_state_and_obs, model, train_metrics = _train_loop(
                 train_state, env_state_and_obs, model, env_step_fn,
                 steps_per_log, half_precision, env.jittable, forward_fn,
             )
+            
+            ### Compute metrics ###
 
-            avg_loss = jnp.nanmean(metrics['loss'])
-            avg_reward = jnp.nanmean(metrics['avg_reward'])
+            avg_loss = jnp.nanmean(train_metrics['loss'])
+            avg_reward = jnp.nanmean(train_metrics['avg_reward'])
 
             if jnp.isnan(avg_loss):
                 print('Loss is nan, breakpoint!')
 
             train_steps_passed += steps_per_log
             env_steps_passed += steps_per_log * effective_batch_size
-
+            
+            log_metrics = dict(
+                avg_reward = avg_reward,
+                loss = avg_loss,
+                train_step = train_steps_passed,
+                env_step = env_steps_passed,
+            )
+            log_metrics = {f'train/{k}': v for k, v in log_metrics.items()}
+  
+            ### Evaluation ###
+  
+            eval_interval = train_config.get('eval_interval', None)
+            if eval_interval > 0 and env_steps_passed - last_eval > eval_interval:
+                eval_key, key = jax.random.split(key)
+                eval_metrics, trajectories = _eval_loop(eval_key, env, model, forward_fn, config)
+                log_metrics.update({f'eval/{k}': v for k, v in eval_metrics.items()})
+                last_eval = env_steps_passed
+            else:
+                trajectories = None
+            
+            ### Logging ###
+            
             pbar.update(steps_per_log * effective_batch_size)
             pbar.set_postfix({
-                'avg_reward': avg_reward,
-                'avg_loss': avg_loss,
-                'train_steps': train_steps_passed,
-                'env_steps': env_steps_passed
+                k[6:]: f'{v:.3f}' 
+                for k, v in log_metrics.items()
+                if np.isscalar(v) and k.startswith('train/')
             })
 
-            if config.wandb.get('enabled', False):
-                import wandb
-                wandb.log({
-                    'loss': avg_loss,
-                    'train_step': train_steps_passed,
-                    'env_step': env_steps_passed
-                })
-                
-                trajectory_log_interval = train_config.get('trajectory_log_interval', None)
-                if trajectory_log_interval > 0 and train_steps_passed - last_trajectory_log > trajectory_log_interval:
-                    pass
+            log_training_metrics(config, log_metrics, train_config, trajectories)
 
 
 @hydra.main(config_path='conf', config_name='train_base')
@@ -188,32 +237,36 @@ def main(config: DictConfig) -> None:
     # Prepare optimizer
     optimizer, opt_state = create_optimizer(model, config.optimizer)
 
-
-    # Train
+    ### Training & optional profiling ###
+    
     train_state = TrainState(rng, opt_state, optimizer.update, config.train)
     
-    import cProfile
-    import pstats
-    import io
+    profiling_enabled = config.get('profile', False)
     
-    # Profile the train function
-    profiler = cProfile.Profile()
-    profiler.enable()
+    if profiling_enabled:
+        import cProfile
+        import pstats
+        import io
+    
+        # Profile the train function
+        profiler = cProfile.Profile()
+        profiler.enable()
+    
     train(env_key, train_state, env, model, config)
-    profiler.disable()
-    print('Done training')
     
-    # Save profiling results
-    s = io.StringIO()
-    ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
-    ps.print_stats()
+    if profiling_enabled:
+        profiler.disable()
     
-    print('Writing stats')
-    with open('train_profile.txt', 'w') as f:
-        f.write(s.getvalue())
-    
-    # Save profiling results in a format suitable for snakeviz
-    profiler.dump_stats('train_profile.prof')
+        # Save profiling results
+        s = io.StringIO()
+        ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+        ps.print_stats()
+        
+        with open('train_profile.txt', 'w') as f:
+            f.write(s.getvalue())
+        
+        # Save profiling results in a format suitable for snakeviz
+        profiler.dump_stats('train_profile.prof')
 
 
 if __name__ == '__main__':
