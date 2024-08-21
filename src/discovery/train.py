@@ -180,11 +180,6 @@ def train(
     _train_loop = train_loop
     if env.jittable:
         _train_loop = jax.jit(train_loop, static_argnums=(3, 4, 5))
-    
-    # If there are multiple environments, I need to make sure that the model forward fn for rollouts can handle multiple obs
-    # If the env is not jittable, and hence the data collection loop is not jittable, I need to make sure that the same function is also jitted
-    # Maybe the answer here is to just vmap it and jit it for all cases, then I don't need to worry about different cases
-
 
     half_precision = config.get('half_precision', False)
     
