@@ -1,30 +1,19 @@
-from typing import Callable, Dict, NamedTuple, Tuple
+from functools import partial
+from typing import Callable, Dict, Tuple
 
 import equinox as eqx
-import gymnasium as gym
 import jax
 from jax import Array
 import jax.numpy as jnp
-from jaxtyping import ArrayLike, PRNGKeyArray, PyTree
+from jaxtyping import PRNGKeyArray, PyTree
 import optax
 
 from discovery.models import ActorCriticModel
-from discovery.utils import tree_replace
+from discovery.rollouts import gather_data, TrajectoryData
+from discovery.utils import scan_or_loop, tree_replace
 
 
 EPSILON = 1e-6
-
-
-TrajectoryData = NamedTuple(
-    'TrajectoryData',
-    obs = ArrayLike,
-    action = ArrayLike,
-    new_obs = ArrayLike,
-    reward = ArrayLike,
-    done = ArrayLike,
-    value = ArrayLike,
-    info = PyTree,
-)
 
 
 class TrainState(eqx.Module):
@@ -101,7 +90,6 @@ def compute_reinforce_grads(
     final_values = jax.vmap(model.value)(final_obs)
     all_values = jnp.concatenate([trajectory_data.value, final_values[:, None]], axis=1)
     trajectory_data = tree_replace(trajectory_data, value=all_values)
-    print(trajectory_data.value)
     
     gaes = calculate_gaes(trajectory_data, gamma, lambda_decay)
 
@@ -181,3 +169,60 @@ if __name__ == '__main__':
 
     gaes = calculate_gaes(trajectory_data, gamma, lambda_decay)
     print(gaes)
+    
+
+@jax.jit
+def batch_train_iter(
+        train_state: TrainState,
+        model: eqx.Module,
+        trajectory_data: TrajectoryData,
+    ):
+    # Trajectory data element shapes: (rollout_length, n_envs, ...) -> (n_envs, rollout_length, ...)
+    trajectory_data = jax.tree.map(partial(jnp.swapaxes, axis1=0, axis2=1), trajectory_data)
+
+    # Compute gradients and update model
+    grads, metrics = compute_reinforce_grads(train_state, model, trajectory_data)
+    train_state, model = apply_grads(train_state, model, grads)
+    train_state = tree_replace(train_state, train_step=train_state.train_step + 1)
+
+    return train_state, model, metrics
+
+
+def train_loop(
+        train_state: TrainState,
+        env_state_and_obs: Tuple[PyTree, PyTree], # (env_state, obs)
+        model: eqx.Module,
+        env_step_fn: Callable,
+        train_steps: int,
+        half_precision: bool = False,
+        env_jittable: bool = True,
+        forward_fn: Callable = None,
+    ):
+    # This may be reduntant if this entire function is jitted, but it is necessary for
+    # when the environment is not jittable, and hence, this entire function is not jitted
+    rollout_forward_fn = forward_fn or jax.jit(jax.vmap(type(model).__call__, in_axes=(None, 0)))
+    
+    def rollout_and_train_step(carry, _):
+        train_state, env_state_and_obs, model = carry
+
+        rollout_key, rng = jax.random.split(train_state.rng)
+        train_state = tree_replace(train_state, rng=rng)
+
+        # Gather data
+        env_state_and_obs, trajectory_data = gather_data(
+            rollout_key, env_state_and_obs, env_step_fn, model, rollout_forward_fn,
+            train_state.config.per_env_batch_size, half_precision, env_jittable,
+        )
+        
+        if not env_jittable:
+            trajectory_data = jax.tree.map(jnp.array, trajectory_data)
+
+        # Train on data
+        train_state, model, metrics = batch_train_iter(
+            train_state, model, trajectory_data)
+
+        return (train_state, env_state_and_obs, model), metrics
+
+    (train_state, env_state_and_obs, model), metrics = scan_or_loop(
+        env_jittable, rollout_and_train_step, (train_state, env_state_and_obs, model), length=train_steps)
+    return train_state, env_state_and_obs, model, metrics

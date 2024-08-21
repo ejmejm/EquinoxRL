@@ -1,17 +1,14 @@
-from functools import partial
 import math
 import tempfile
 import time
-from typing import Callable, NamedTuple, Tuple
+from typing import Tuple
 
 import equinox as eqx
 import hydra
 import jax
-import jax.nn as jnn
 import jax.numpy as jnp
 from jax.experimental.compilation_cache import compilation_cache
-from jaxtyping import ArrayLike, PRNGKeyArray, PyTree
-import numpy as np
+from jaxtyping import PRNGKeyArray
 import omegaconf
 from omegaconf import DictConfig
 import optax
@@ -20,8 +17,7 @@ from tqdm import tqdm
 from envs.envs import create_env
 from envs.base_env import BaseEnv, VectorizedGymLikeEnv
 from models import ActorCriticModel, get_feature_extractor_cls, get_activation_fn
-from training import apply_grads, compute_reinforce_grads, TrainState, TrajectoryData
-from utils import scan_or_loop, tree_replace
+from training import train_loop, TrainState
 
 
 # jax.config.update("jax_debug_nans", True)
@@ -67,116 +63,18 @@ def create_optimizer(
 ) -> Tuple[optax.GradientTransformation, optax.OptState]:
     optimizer = optax.adam(optimizer_config.learning_rate)
     opt_state = optimizer.init(model)
-    return optimizer, opt_state
-
-    
-@partial(jax.jit, static_argnums=(1,))
-def determine_action(model, forward_fn, obs, rng):
-    print('Compiling determine_action')
-    act_key, random_key, act_mask_key, rng = jax.random.split(rng, 4)
-        
-    act_logits, value = forward_fn(model, obs)
-    model_action = jax.random.categorical(act_key, act_logits, axis=-1)
-    
-    # 10% chance of taking random action
-    random_action = jax.random.randint(random_key, shape=model_action.shape, minval=0, maxval=act_logits.shape[-1])
-    random_mask = jax.random.uniform(act_mask_key, shape=model_action.shape) < 0.1
-    action = jnp.where(random_mask, random_action, model_action)
-    action = model_action
-    
-    return action, value, rng
+    return optimizer, opt_state  
 
 
-def gather_data(
-        key: PRNGKeyArray,
-        env_state_and_obs: Tuple[PyTree, PyTree],
-        env_step_fn: Callable,
-        model: eqx.Module,
-        forward_fn: Callable[[eqx.Module, ArrayLike], Tuple[ArrayLike, ArrayLike]],
-        rollout_length: int,
-        half_precision: bool = False,
-        env_jittable: bool = True,
-    ) -> Tuple[Tuple[PyTree, PyTree], TrajectoryData]:
-
-    def predict_and_step_fn(state, _):
-        (env_state, obs), rng = state
-        
-        action, value, rng = determine_action(model, forward_fn, obs, rng)
-        
-        if not env_jittable:
-            action = np.array(action)
-        
-        env_state, new_obs, reward, done, info = env_step_fn(env_state, action)
-        if half_precision:
-            new_obs = new_obs.astype(jnp.bfloat16)
-            reward = reward.astype(jnp.bfloat16)
-            done = done.astype(jnp.bfloat16)
-        
-        return ((env_state, new_obs), rng), TrajectoryData(obs, action, new_obs, reward, done, value, info)
-
-    scan_state = (env_state_and_obs, key)
-    scan_state, train_sequences = scan_or_loop(
-        env_jittable, predict_and_step_fn, scan_state, length=rollout_length)
-    env_state_and_obs = scan_state[0]
-
-    return env_state_and_obs, train_sequences
+def to_half_precision(x: jax.Array):
+    """Convert array to bf16 if it's a full precision float."""
+    if x.dtype == jnp.float32:
+        return x.astype(jnp.bfloat16)
+    return x
 
 
-@jax.jit
-def batch_train_iter(
-        train_state: TrainState,
-        model: eqx.Module,
-        trajectory_data: TrajectoryData,
-    ):
-    # Trajectory data element shapes: (rollout_length, n_envs, ...) -> (n_envs, rollout_length, ...)
-    trajectory_data = jax.tree.map(partial(jnp.swapaxes, axis1=0, axis2=1), trajectory_data)
-
-    # Compute gradients and update model
-    grads, metrics = compute_reinforce_grads(train_state, model, trajectory_data)
-    train_state, model = apply_grads(train_state, model, grads)
-    train_state = tree_replace(train_state, train_step=train_state.train_step + 1)
-
-    return train_state, model, metrics
-
-
-def train_loop(
-        train_state: TrainState,
-        env_state_and_obs: Tuple[PyTree, PyTree], # (env_state, obs)
-        model: eqx.Module,
-        env_step_fn: Callable,
-        train_steps: int,
-        half_precision: bool = False,
-        env_jittable: bool = True,
-        forward_fn: Callable = None,
-    ):
-    # This may be reduntant if this entire function is jitted, but it is necessary for
-    # when the environment is not jittable, and hence, this entire function is not jitted
-    rollout_forward_fn = forward_fn or jax.jit(jax.vmap(type(model).__call__, in_axes=(None, 0)))
-    
-    def rollout_and_train_step(carry, _):
-        train_state, env_state_and_obs, model = carry
-
-        rollout_key, rng = jax.random.split(train_state.rng)
-        train_state = tree_replace(train_state, rng=rng)
-
-        # Gather data
-        env_state_and_obs, trajectory_data = gather_data(
-            rollout_key, env_state_and_obs, env_step_fn, model, rollout_forward_fn,
-            train_state.config.per_env_batch_size, half_precision, env_jittable,
-        )
-        
-        if not env_jittable:
-            trajectory_data = jax.tree.map(jnp.array, trajectory_data)
-
-        # Train on data
-        train_state, model, metrics = batch_train_iter(
-            train_state, model, trajectory_data)
-
-        return (train_state, env_state_and_obs, model), metrics
-
-    (train_state, env_state_and_obs, model), metrics = scan_or_loop(
-        env_jittable, rollout_and_train_step, (train_state, env_state_and_obs, model), length=train_steps)
-    return train_state, env_state_and_obs, model, metrics
+def validate_config(config: DictConfig):
+    pass
 
 
 def train(
@@ -190,6 +88,7 @@ def train(
     effective_batch_size = train_config.per_env_batch_size * config.env.n_envs
     steps_per_log = train_config.log_interval // effective_batch_size
     total_steps = train_config.steps // effective_batch_size
+    last_trajectory_log = 0
     
     env_steps_passed = 0
     train_steps_passed = 0
@@ -248,17 +147,10 @@ def train(
                     'train_step': train_steps_passed,
                     'env_step': env_steps_passed
                 })
-
-
-def to_half_precision(x: jax.Array):
-    """Convert array to bf16 if it's a full precision float."""
-    if x.dtype == jnp.float32:
-        return x.astype(jnp.bfloat16)
-    return x
-
-
-def validate_config(config: DictConfig):
-    pass
+                
+                trajectory_log_interval = train_config.get('trajectory_log_interval', None)
+                if trajectory_log_interval > 0 and train_steps_passed - last_trajectory_log > trajectory_log_interval:
+                    pass
 
 
 @hydra.main(config_path='conf', config_name='train_base')
@@ -290,9 +182,8 @@ def main(config: DictConfig) -> None:
         model_config = config.model,
         half_precision = config.half_precision,
     )
-    print('# Model params:', sum(jax.tree.leaves(jax.tree.map(lambda x: math.prod(x.shape), model))))
-
     print(model)
+    print('# Model params:', sum(jax.tree.leaves(jax.tree.map(lambda x: math.prod(x.shape), model))))
 
     # Prepare optimizer
     optimizer, opt_state = create_optimizer(model, config.optimizer)
