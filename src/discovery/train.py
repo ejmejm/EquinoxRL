@@ -11,16 +11,17 @@ import jax.nn as jnn
 import jax.numpy as jnp
 from jax.experimental.compilation_cache import compilation_cache
 from jaxtyping import ArrayLike, PRNGKeyArray, PyTree
+import numpy as np
 import omegaconf
 from omegaconf import DictConfig
 import optax
 from tqdm import tqdm
 
 from envs.envs import create_env
-from envs.equinox_env import EquinoxEnv
+from envs.base_env import BaseEnv, VectorizedGymLikeEnv
 from models import ActorCriticModel, get_feature_extractor_cls, get_activation_fn
 from training import apply_grads, compute_reinforce_grads, TrainState, TrajectoryData
-from utils import tree_replace
+from utils import scan_or_loop, tree_replace
 
 
 # jax.config.update("jax_debug_nans", True)
@@ -68,6 +69,23 @@ def create_optimizer(
     opt_state = optimizer.init(model)
     return optimizer, opt_state
 
+    
+@partial(jax.jit, static_argnums=(1,))
+def determine_action(model, forward_fn, obs, rng):
+    print('Compiling determine_action')
+    act_key, random_key, act_mask_key, rng = jax.random.split(rng, 4)
+        
+    act_logits, value = forward_fn(model, obs)
+    model_action = jax.random.categorical(act_key, act_logits, axis=-1)
+    
+    # 10% chance of taking random action
+    random_action = jax.random.randint(random_key, shape=model_action.shape, minval=0, maxval=act_logits.shape[-1])
+    random_mask = jax.random.uniform(act_mask_key, shape=model_action.shape) < 0.1
+    action = jnp.where(random_mask, random_action, model_action)
+    action = model_action
+    
+    return action, value, rng
+
 
 def gather_data(
         key: PRNGKeyArray,
@@ -77,19 +95,16 @@ def gather_data(
         forward_fn: Callable[[eqx.Module, ArrayLike], Tuple[ArrayLike, ArrayLike]],
         rollout_length: int,
         half_precision: bool = False,
+        env_jittable: bool = True,
     ) -> Tuple[Tuple[PyTree, PyTree], TrajectoryData]:
+
     def predict_and_step_fn(state, _):
         (env_state, obs), rng = state
-        act_key, random_key, act_mask_key, rng = jax.random.split(rng, 4)
-            
-        act_logits, value = forward_fn(model, obs)
-        model_action = jax.random.categorical(act_key, act_logits, axis=-1)
         
-        # 10% chance of taking random action
-        random_action = jax.random.randint(random_key, shape=model_action.shape, minval=0, maxval=act_logits.shape[-1])
-        random_mask = jax.random.uniform(act_mask_key, shape=model_action.shape) < 0.1
-        action = jnp.where(random_mask, random_action, model_action)
-        action = model_action
+        action, value, rng = determine_action(model, forward_fn, obs, rng)
+        
+        if not env_jittable:
+            action = np.array(action)
         
         env_state, new_obs, reward, done, info = env_step_fn(env_state, action)
         if half_precision:
@@ -98,11 +113,10 @@ def gather_data(
             done = done.astype(jnp.bfloat16)
         
         return ((env_state, new_obs), rng), TrajectoryData(obs, action, new_obs, reward, done, value, info)
-    
-    # TODO: Add support for non-jittable env step fn with a for loop
+
     scan_state = (env_state_and_obs, key)
-    scan_state, train_sequences = jax.lax.scan(
-        predict_and_step_fn, scan_state, length=rollout_length)
+    scan_state, train_sequences = scan_or_loop(
+        env_jittable, predict_and_step_fn, scan_state, length=rollout_length)
     env_state_and_obs = scan_state[0]
 
     return env_state_and_obs, train_sequences
@@ -132,10 +146,12 @@ def train_loop(
         env_step_fn: Callable,
         train_steps: int,
         half_precision: bool = False,
+        env_jittable: bool = True,
+        forward_fn: Callable = None,
     ):
     # This may be reduntant if this entire function is jitted, but it is necessary for
     # when the environment is not jittable, and hence, this entire function is not jitted
-    rollout_forward_fn = jax.jit(jax.vmap(type(model).__call__, in_axes=(None, 0)))
+    rollout_forward_fn = forward_fn or jax.jit(jax.vmap(type(model).__call__, in_axes=(None, 0)))
     
     def rollout_and_train_step(carry, _):
         train_state, env_state_and_obs, model = carry
@@ -146,8 +162,11 @@ def train_loop(
         # Gather data
         env_state_and_obs, trajectory_data = gather_data(
             rollout_key, env_state_and_obs, env_step_fn, model, rollout_forward_fn,
-            train_state.config.per_env_batch_size, half_precision,
+            train_state.config.per_env_batch_size, half_precision, env_jittable,
         )
+        
+        if not env_jittable:
+            trajectory_data = jax.tree.map(jnp.array, trajectory_data)
 
         # Train on data
         train_state, model, metrics = batch_train_iter(
@@ -155,16 +174,15 @@ def train_loop(
 
         return (train_state, env_state_and_obs, model), metrics
 
-    # TODO: Add support for non-jittable env step fn with a for loop
-    (train_state, env_state_and_obs, model), metrics = jax.lax.scan(
-        rollout_and_train_step, (train_state, env_state_and_obs, model), length=train_steps)
+    (train_state, env_state_and_obs, model), metrics = scan_or_loop(
+        env_jittable, rollout_and_train_step, (train_state, env_state_and_obs, model), length=train_steps)
     return train_state, env_state_and_obs, model, metrics
 
 
 def train(
         key: PRNGKeyArray,
         train_state: TrainState,
-        env: EquinoxEnv,
+        env: BaseEnv,
         model: eqx.Module,
         config: DictConfig,
     ):
@@ -179,7 +197,8 @@ def train(
     # If the env is jittable, we can jit the entire train loop
     _train_loop = train_loop
     if env.jittable:
-        _train_loop = jax.jit(train_loop, static_argnums=(3, 4, 5))
+        _train_loop = jax.jit(train_loop, static_argnums=(3, 4, 5, 7))
+    forward_fn = jax.jit(jax.vmap(type(model).__call__, in_axes=(None, 0)))
 
     half_precision = config.get('half_precision', False)
     
@@ -190,7 +209,9 @@ def train(
         env_state, obs = jax.vmap(env.reset)(env_keys)
         env_step_fn = jax.vmap(env.step)
     else:
-        raise ValueError('Only jittable environments are supported for now.')
+        assert isinstance(env, VectorizedGymLikeEnv), "Non-jittable environments must be pre-vectorized!"
+        env_state, obs = env.reset()
+        env_step_fn = env.step
     
     if half_precision:
         obs = obs.astype(jnp.bfloat16)
@@ -199,7 +220,9 @@ def train(
     with tqdm(total=train_config.steps) as pbar:
         for _ in range(total_steps // steps_per_log):
             train_state, env_state_and_obs, model, metrics = _train_loop(
-                train_state, env_state_and_obs, model, env_step_fn, steps_per_log, half_precision)
+                train_state, env_state_and_obs, model, env_step_fn,
+                steps_per_log, half_precision, env.jittable, forward_fn,
+            )
 
             avg_loss = jnp.nanmean(metrics['loss'])
             avg_reward = jnp.nanmean(metrics['avg_reward'])
@@ -277,7 +300,29 @@ def main(config: DictConfig) -> None:
 
     # Train
     train_state = TrainState(rng, opt_state, optimizer.update, config.train)
+    
+    import cProfile
+    import pstats
+    import io
+    
+    # Profile the train function
+    profiler = cProfile.Profile()
+    profiler.enable()
     train(env_key, train_state, env, model, config)
+    profiler.disable()
+    print('Done training')
+    
+    # Save profiling results
+    s = io.StringIO()
+    ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+    ps.print_stats()
+    
+    print('Writing stats')
+    with open('train_profile.txt', 'w') as f:
+        f.write(s.getvalue())
+    
+    # Save profiling results in a format suitable for snakeviz
+    profiler.dump_stats('train_profile.prof')
 
 
 if __name__ == '__main__':

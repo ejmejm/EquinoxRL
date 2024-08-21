@@ -221,9 +221,9 @@ class CollectObjectsEnv(gym.Env):
         )
         self.action_space = gym.spaces.Discrete(4)
     
-    def reset(self, random=False):
-        obs = np.asarray(self._env.reset()['image'], dtype=np.float32)
-        return obs
+    def reset(self, seed=None, random=False):
+        obs = np.asarray(self._env.reset(random=random)['image'], dtype=np.float32)
+        return obs, {}
 
     def step(self, action):
         obs, reward, done, truncated = self._env.step(action)

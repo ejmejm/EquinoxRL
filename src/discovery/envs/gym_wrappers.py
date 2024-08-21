@@ -17,8 +17,8 @@ class RescaleObservationRange(gym.Wrapper):
         return obs * self.scale_factor
 
     def reset(self, **kwargs):
-        obs = self.env.reset(**kwargs)
-        return self.observation(obs)
+        obs, info = self.env.reset(**kwargs)
+        return self.observation(obs), info
 
     def step(self, action):
         obs, reward, done, truncation, info = self.env.step(action)
@@ -43,8 +43,8 @@ class SwapChannelToFirstAxis(gym.Wrapper):
         return np.transpose(obs, (2, 0, 1))
 
     def reset(self, **kwargs):
-        obs = self.env.reset(**kwargs)
-        return self.observation(obs)
+        obs, info = self.env.reset(**kwargs)
+        return self.observation(obs), info
 
     def step(self, action):
         obs, reward, done, truncation, info = self.env.step(action)
