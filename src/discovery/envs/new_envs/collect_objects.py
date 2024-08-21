@@ -235,7 +235,7 @@ class CollectObjectsEnv(gym.Env):
 
 
 # Simple test to instantiate and try the functions
-if __name__ == "__main__":
+if __name__ == '__main__':
     # Instantiate the environment
     env = CollectObjectsEnv(seed=0, breadth=7, length=7)
     
@@ -243,7 +243,7 @@ if __name__ == "__main__":
     # env = gym.wrappers.GrayScaleObservation(env)
 
     # Reset the environment and get initial observation
-    obs = env.reset() * 255.0
+    obs = env.reset()[0] * 255.0
     print("Initial observation shape:", obs.shape)
     # Print range:
     print(f"Range: {obs.min()} to {obs.max()}")
