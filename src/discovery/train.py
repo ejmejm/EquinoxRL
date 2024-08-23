@@ -1,4 +1,7 @@
+import cProfile
+import io
 import math
+import pstats
 import tempfile
 import time
 from typing import Tuple
@@ -98,7 +101,7 @@ def log_training_metrics(config, log_metrics, train_config, trajectories):
         import wandb
         for k, v in log_metrics.items():
             if isinstance(v, list):
-                log_metrics[k] = wandb.Histogram(v, num_bins=32)
+                log_metrics[k] = wandb.Histogram(v, num_bins=20)
         wandb.log(log_metrics)
         if train_config.get('log_trajectories', False) and trajectories is not None:
             log_trajectories(trajectories)
@@ -181,6 +184,7 @@ def train(
   
             ### Evaluation ###
   
+            # TODO: Fix bug where non-jittable env states are reset for evaluation, effecting the next training batch
             eval_interval = train_config.get('eval_interval', None)
             if eval_interval > 0 and env_steps_passed - last_eval > eval_interval:
                 eval_key, key = jax.random.split(key)
@@ -244,12 +248,9 @@ def main(config: DictConfig) -> None:
     profiling_enabled = config.get('profile', False)
     
     if profiling_enabled:
-        import cProfile
-        import pstats
-        import io
-    
         # Profile the train function
         profiler = cProfile.Profile()
+        print('Profiling enabled, starting...')
         profiler.enable()
     
     train(env_key, train_state, env, model, config)
