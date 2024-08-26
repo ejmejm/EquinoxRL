@@ -110,47 +110,25 @@ def train_and_test(
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
             
-            step += 1
-            pbar.update(1)
-            
             if step % log_interval == 0:
-                wandb.log({
-                    "step": step,
-                    "epoch": epoch,
-                    "train/loss": running_loss / 100,
-                    "train/accuracy": 100. * correct / total
-                })
+                log_training_metrics(
+                    step, epoch, running_loss, correct, total, samples,
+                    model, images, num_distractors,
+                )
                 running_loss = 0.0
                 correct = 0
                 total = 0
             
-            if step % test_interval == 0:
-                test_loss, test_accuracy = test_model(model, test_loader, criterion, num_distractors, use_half_precision, device)
-                wandb.log({
-                    "step": step,
-                    "epoch": epoch,
-                    "samples": samples,
-                    "test/loss": test_loss,
-                    "test/accuracy": test_accuracy
-                })
+            if step % test_interval == 0 or step == total_steps - 1:
+                test_loss, test_accuracy = test_model(
+                    model, test_loader, criterion, num_distractors, use_half_precision, device)
+                log_test_metrics(
+                    step, epoch, samples, test_loss, test_accuracy, model, images, num_distractors)
                 model.train()
-                # Log histograms and norms of the first layer weights
-                first_layer_weights = model.layers[0].weight
-                input_size = images.size(1)
-                real_weights = first_layer_weights[:, :input_size].flatten()
-                distractor_weights = first_layer_weights[:, input_size:].flatten()
-                
-                wandb.log({
-                    "step": step,
-                    "epoch": epoch,
-                    "samples": samples,
-                    "weights/real_input": wandb.Histogram(real_weights.detach().cpu().numpy()),
-                    "weights/distractor_input": wandb.Histogram(distractor_weights.detach().cpu().numpy()),
-                    "norms/real_input_l1": (torch.norm(real_weights, p=1) / real_weights.numel()).item(),
-                    "norms/real_input_l2": (torch.norm(real_weights, p=2) / torch.sqrt(torch.tensor(real_weights.numel()))).item(),
-                    "norms/distractor_input_l1": (torch.norm(distractor_weights, p=1) / distractor_weights.numel()).item(),
-                    "norms/distractor_input_l2": (torch.norm(distractor_weights, p=2) / torch.sqrt(torch.tensor(distractor_weights.numel()))).item()
-                })
+            
+            step += 1
+            pbar.update(1)
+            
             if step >= total_steps:
                 break
     pbar.close()
@@ -182,6 +160,64 @@ def test_model(model, test_loader, criterion, num_distractors, use_half_precisio
             test_correct += predicted.eq(labels).sum().item()
     
     return test_loss / len(test_loader), 100. * test_correct / test_total
+
+
+def log_training_metrics(step, epoch, running_loss, correct, total, samples, model, images, num_distractors):
+    wandb.log({
+        "step": step,
+        "epoch": epoch,
+        "train/loss": running_loss / 100,
+        "train/accuracy": 100. * correct / total
+    })
+    log_weight_metrics(step, epoch, samples, model, images, num_distractors, prefix="train")
+
+
+def log_test_metrics(step, epoch, samples, test_loss, test_accuracy, model, images, num_distractors):
+    wandb.log({
+        "step": step,
+        "epoch": epoch,
+        "samples": samples,
+        "test/loss": test_loss,
+        "test/accuracy": test_accuracy
+    })
+    log_weight_metrics(step, epoch, samples, model, images, num_distractors, prefix="test")
+
+
+def log_weight_metrics(step, epoch, samples, model, images, num_distractors, prefix):
+    first_layer_weights = model.layers[0].weight
+    input_size = images.size(1)
+    real_weights = first_layer_weights[:, :input_size].flatten()
+    distractor_weights = first_layer_weights[:, input_size:].flatten()
+    
+    # Calculate L1 norms for each input feature
+    feature_l1_norms = torch.norm(first_layer_weights, p=1, dim=0)
+    
+    # Sort the L1 norms and get the indices
+    sorted_indices = torch.argsort(feature_l1_norms, descending=True)
+    
+    # Calculate the percentage of distractor features in the lowest num_distractors features
+    lowest_indices = sorted_indices[-num_distractors:]
+    num_distractor_in_lowest = torch.sum(lowest_indices >= input_size).item()
+    fraction_distractor_in_lowest = (num_distractor_in_lowest / num_distractors) if num_distractors > 0 else 0
+    
+    # Calculate the percentage of real features in the top input_size features
+    highest_indices = sorted_indices[:input_size]
+    num_real_in_highest = torch.sum(highest_indices < input_size).item()
+    fraction_real_in_highest = num_real_in_highest / input_size
+    
+    wandb.log({
+        "step": step,
+        "epoch": epoch,
+        "samples": samples,
+        f"{prefix}/weights/real_input": wandb.Histogram(real_weights.detach().cpu().numpy()),
+        f"{prefix}/weights/distractor_input": wandb.Histogram(distractor_weights.detach().cpu().numpy()),
+        f"{prefix}/norms/real_input_l1": (torch.norm(real_weights, p=1) / real_weights.numel()).item(),
+        f"{prefix}/norms/real_input_l2": (torch.norm(real_weights, p=2) / torch.sqrt(torch.tensor(real_weights.numel()))).item(),
+        f"{prefix}/norms/distractor_input_l1": (torch.norm(distractor_weights, p=1) / distractor_weights.numel()).item(),
+        f"{prefix}/norms/distractor_input_l2": (torch.norm(distractor_weights, p=2) / torch.sqrt(torch.tensor(distractor_weights.numel()))).item(),
+        f"{prefix}/weights/fraction_distractor_in_lowest": fraction_distractor_in_lowest,
+        f"{prefix}/weights/fraction_real_in_highest": fraction_real_in_highest
+    })
 
 
 def set_seed(seed):
