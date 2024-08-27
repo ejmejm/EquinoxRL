@@ -68,6 +68,7 @@ def initialize_model_and_optimizer(input_size, hidden_sizes, num_classes, learni
 def train_and_test(
         model, train_loader, test_loader, criterion, optimizer, num_distractors, total_steps,
         test_interval, log_interval, use_half_precision=False, device='cuda',
+        prune_features=False, feature_prune_threshold=0.0, feature_ema_decay=0.99
     ):
     model.train()
     running_loss = 0.0
@@ -80,6 +81,14 @@ def train_and_test(
     # Set up scaler for half precision training
     scaler = torch.amp.GradScaler(device) if use_half_precision else None
     
+    # Initialize EMA for feature pruning
+    real_features_pruned = 0
+    distractor_features_pruned = 0
+    if prune_features:
+        feature_ema = torch.zeros([model.layers[0].weight.shape[1]], device=device)
+        pruning_start_step = int(1 / (1 - feature_ema_decay))
+        pruned_mask = torch.ones([model.layers[0].weight.shape[1]], device=device, dtype=torch.bool)
+    
     pbar = tqdm(total=total_steps, desc="Training Progress")
     while step < total_steps:
         epoch += 1
@@ -87,6 +96,8 @@ def train_and_test(
             images = images.view(images.size(0), -1).to(device)
             distractors = torch.rand(images.size(0), num_distractors, device=device)
             inputs = torch.cat((images, distractors), dim=1)
+            if prune_features:
+                inputs = inputs * pruned_mask.unsqueeze(0)
             labels = labels.to(device)
             samples += images.size(0)
             
@@ -105,6 +116,21 @@ def train_and_test(
                 loss.backward()
                 optimizer.step()
             
+            # Update EMA and prune features if enabled
+            if prune_features:
+                with torch.no_grad():
+                    feature_l1_norms = torch.norm(model.layers[0].weight, p=1, dim=0)
+                    feature_ema = feature_ema * feature_ema_decay + feature_l1_norms * (1 - feature_ema_decay)
+                    
+                    # Prune features below threshold after pruning_start_step
+                    if step >= pruning_start_step:
+                        n_weights_per_feature = model.layers[0].weight.shape[0]
+                        new_pruned = (feature_ema / n_weights_per_feature < feature_prune_threshold) & pruned_mask
+                        pruned_mask &= ~new_pruned
+                        real_features_pruned += new_pruned[:images.size(1)].sum().item()
+                        distractor_features_pruned += new_pruned[images.size(1):].sum().item()
+                        # model.layers[0].weight.data *= pruned_mask.unsqueeze(0)
+            
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += labels.size(0)
@@ -114,6 +140,7 @@ def train_and_test(
                 log_training_metrics(
                     step, epoch, running_loss, correct, total, samples,
                     model, images, num_distractors,
+                    prune_features, real_features_pruned, distractor_features_pruned
                 )
                 running_loss = 0.0
                 correct = 0
@@ -121,7 +148,8 @@ def train_and_test(
             
             if step % test_interval == 0 or step == total_steps - 1:
                 test_loss, test_accuracy = test_model(
-                    model, test_loader, criterion, num_distractors, use_half_precision, device)
+                    model, test_loader, criterion, num_distractors, use_half_precision, device,
+                    prune_features=prune_features, pruned_mask=pruned_mask if prune_features else None)
                 log_test_metrics(
                     step, epoch, samples, test_loss, test_accuracy, model, images, num_distractors)
                 model.train()
@@ -134,7 +162,8 @@ def train_and_test(
     pbar.close()
 
 
-def test_model(model, test_loader, criterion, num_distractors, use_half_precision=False, device='cuda'):
+def test_model(model, test_loader, criterion, num_distractors, use_half_precision=False, device='cuda',
+               prune_features=False, pruned_mask=None):
     model.eval()
     test_loss = 0.0
     test_correct = 0
@@ -145,6 +174,8 @@ def test_model(model, test_loader, criterion, num_distractors, use_half_precisio
             images = images.view(images.size(0), -1).to(device)
             distractors = torch.rand(images.size(0), num_distractors, device=device)
             inputs = torch.cat((images, distractors), dim=1)
+            if prune_features and pruned_mask is not None:
+                inputs = inputs * pruned_mask.unsqueeze(0)
             labels = labels.to(device)
             
             if use_half_precision:
@@ -162,13 +193,19 @@ def test_model(model, test_loader, criterion, num_distractors, use_half_precisio
     return test_loss / len(test_loader), 100. * test_correct / test_total
 
 
-def log_training_metrics(step, epoch, running_loss, correct, total, samples, model, images, num_distractors):
-    wandb.log({
+def log_training_metrics(step, epoch, running_loss, correct, total, samples, model, images, num_distractors,
+                         prune_features, real_features_pruned, distractor_features_pruned):
+    log_dict = {
         "step": step,
         "epoch": epoch,
-        "train/loss": running_loss / 100,
-        "train/accuracy": 100. * correct / total
-    })
+        "train/loss": running_loss / 100.0,
+        "train/accuracy": 100.0 * correct / total
+    }
+    if prune_features:
+        log_dict["real_features_pruned"] = real_features_pruned
+        log_dict["distractor_features_pruned"] = distractor_features_pruned
+        
+    wandb.log(log_dict)
     log_weight_metrics(step, epoch, samples, model, images, num_distractors, prefix="train")
 
 
@@ -243,6 +280,9 @@ def parse_arguments():
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay")
     parser.add_argument("--zero_init", type=bool, default=False, help="Zero initialize the first layer")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--prune_features", type=bool, default=False, help="Enable feature pruning")
+    parser.add_argument("--feature_prune_threshold", type=float, default=0.0, help="Threshold for feature pruning")
+    parser.add_argument("--feature_ema_decay", type=float, default=0.99, help="EMA decay for feature pruning")
     args = parser.parse_args()
 
     args.input_size = 16 * 16
@@ -282,7 +322,7 @@ if __name__ == '__main__':
     train_and_test(
         model, train_loader, test_loader, criterion, optimizer, args.num_distractors,
         args.total_steps, args.test_interval, args.log_interval, args.use_half_precision,
-        device,
+        device, args.prune_features, args.feature_prune_threshold, args.feature_ema_decay,
     )
 
     print("Training complete.")
