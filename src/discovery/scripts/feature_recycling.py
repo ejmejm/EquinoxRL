@@ -19,20 +19,20 @@ class FeatureInfo:
     utility: float
     distribution_params: dict
     last_update: int
+    creation_step: int
 
-
-class DataGenerator:
-    def __init__(self, feature_dim: int, n_classes: int, task: str = 'classification'):
+class DummyTask:
+    def __init__(self, feature_dim: int, n_classes: int, task_type: str = 'classification'):
         """Initialize data generator.
         
         Args:
             feature_dim: Number of input features
             n_classes: Number of classes for classification
-            task: Type of task ('classification' or 'regression')
+            task_type: Type of task ('classification' or 'regression')
         """
         self.feature_dim = feature_dim
         self.n_classes = n_classes
-        self.task = task
+        self.task_type = task_type
         
         # Set distributions for each feature
         self.distributions = [random.choice(['uniform', 'normal']) 
@@ -53,10 +53,58 @@ class DataGenerator:
             inputs = torch.stack(features, dim=1)
             
             # Generate targets
-            if self.task == 'classification':
+            if self.task_type == 'classification':
                 targets = torch.randint(0, self.n_classes, (batch_size,))
             else:
                 targets = torch.randn(batch_size)
+            
+            yield inputs, targets
+
+
+class GEOFFTask:
+    def __init__(
+        self, 
+        feature_dim: int = 20, 
+        sign_flip_interval: int = 20,
+        active_features: int = 5,
+    ):
+        """Initialize tracking task where target is sum of first k inputs with changing signs.
+        
+        Args:
+            feature_dim: Number of input features (default 20)
+            sign_flip_interval: How often to flip signs (in steps)
+            active_features: Number of features that contribute to target (default 5)
+        """
+        self.feature_dim = feature_dim
+        self.sign_flip_interval = sign_flip_interval
+        self.active_features = active_features
+        
+        # Initialize signs randomly for active features (+1 or -1)
+        self.signs = torch.randint(0, 2, (active_features,)) * 2 - 1
+        
+        self.steps_since_flip = 0
+        self.task_type = 'regression'
+    
+    def _randomize_sign(self):
+        """Randomly flip the sign of one random feature."""
+        # Choose random feature to flip
+        feature_to_flip = random.randrange(self.active_features)
+        # Flip its sign
+        self.signs[feature_to_flip] *= -1
+    
+    def get_iterator(self, batch_size: int) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        """Get iterator that generates infinite batches of data."""
+        while True:
+            # Generate all features from normal distribution
+            inputs = torch.randn(batch_size, self.feature_dim)
+            # Calculate target using only first k features with signs
+            targets = (self.signs.unsqueeze(0) * inputs[:, :self.active_features]).sum(dim=1)
+            
+            # Update sign flip counter and flip if needed
+            self.steps_since_flip += 1
+            if self.sign_flip_interval > 0 and self.steps_since_flip >= self.sign_flip_interval:
+                self._randomize_sign()
+                self.steps_since_flip = 0
             
             yield inputs, targets
 
@@ -78,6 +126,7 @@ class RecyclingMLP(nn.Module):
             n_layers: Number of layers (including output)
             hidden_dim: Size of hidden layers
             weight_init_method: How to initialize weights ('zeros' or 'kaiming')
+            sample_with_replacement: Whether to sample real features with replacement
             device: Device to put model on
         """
         super().__init__()
@@ -130,6 +179,7 @@ class FeatureRecycler:
         utility_decay: float,
         use_cbp_utility: bool,
         feature_protection_steps: int,
+        sample_with_replacement: bool = False,
         device: str = 'cuda'
     ):
         """
@@ -150,6 +200,7 @@ class FeatureRecycler:
         self.utility_decay = utility_decay
         self.use_cbp_utility = use_cbp_utility
         self.feature_protection_steps = feature_protection_steps
+        self.sample_with_replacement = sample_with_replacement
         self.device = device
         
         self.recycle_accumulator = 0.0
@@ -166,12 +217,27 @@ class FeatureRecycler:
         """Add a new feature (real or distractor) at the given index."""
         is_real = random.random() > self.distractor_chance
         
-        if is_real:
+        # Get list of currently used feature indices
+        used_indices = set([
+            f.distribution_params['feature_idx'] 
+            for f in self.features.values() 
+            if f.is_real
+        ]) if not self.sample_with_replacement else set()
+            
+        if is_real and len(used_indices) < self.n_real_features:
+            # Get available indices
+            available_indices = [
+                i for i in range(self.n_real_features) 
+                if i not in used_indices
+            ]
+            
             dist_params = {
-                'type': 'real', 
-                'feature_idx': random.randrange(self.n_real_features)
+                'type': 'real',
+                'feature_idx': random.choice(available_indices)
             }
         else:
+            is_real = False
+            
             # 50% chance of uniform vs normal distribution
             if random.random() < 0.5:
                 dist_params = {
@@ -192,7 +258,8 @@ class FeatureRecycler:
             is_real=is_real,
             utility=0.0,
             distribution_params=dist_params,
-            last_update=step
+            last_update=step,
+            creation_step=step,
         )
     
     def _generate_feature_values(self, batch_size: int, real_features: torch.Tensor) -> torch.Tensor:
@@ -247,7 +314,7 @@ class FeatureRecycler:
         # Filter out protected features
         eligible_features = [
             i for i, f in self.features.items() 
-            if current_step - f.last_update >= self.feature_protection_steps
+            if current_step - f.creation_step >= self.feature_protection_steps
         ]
         
         if not eligible_features:
@@ -322,6 +389,21 @@ class FeatureRecycler:
         return feature_values
 
 
+def prepare_task(args: argparse.Namespace):
+    if args.task == 'dummy':
+        return DummyTask(args.n_features, args.n_classes, args.task_type)
+    elif args.task == 'static_linear_geoff':
+        # Non-stochastic version of the 1-layer GEOFF task
+        args.n_classes = 1
+        args.task_type = 'regression'
+        return GEOFFTask(args.n_real_features, -1, args.n_real_features)
+    elif args.task == 'linear_geoff':
+        # Stochastic version of the 1-layer GEOFF task
+        args.n_classes = 1
+        args.task_type = 'regression'
+        return GEOFFTask(args.n_real_features, 20, args.n_real_features)
+
+
 def set_seed(seed: Optional[int]):
     """Set random seeds for reproducibility."""
     if seed is not None:
@@ -338,7 +420,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Feature Recycling Experiment")
     
     # Dataset parameters
-    parser.add_argument('--task', type=str, default='classification',
+    parser.add_argument('--task_type', type=str, default='classification',
                       choices=['classification', 'regression'],
                       help='Type of task to perform')
     parser.add_argument('--n_classes', type=int, default=10,
@@ -382,6 +464,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--use_idbd', action='store_true',
                       help='Whether to use IDBD')
     
+    # Task parameters
+    parser.add_argument('--task', type=str,
+                      choices=['dummy', 'static_linear_geoff', 'linear_geoff'],
+                      help='Type of task to perform')
+    
     # Other parameters
     parser.add_argument('--seed', type=int, default=None,
                       help='Random seed for reproducibility')
@@ -407,6 +494,9 @@ if __name__ == '__main__':
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
+    task = prepare_task(args)
+    task_iterator = task.get_iterator(args.batch_size)
+    
     # Initialize model and optimizer
     model = RecyclingMLP(
         input_size=args.n_features,
@@ -417,7 +507,7 @@ if __name__ == '__main__':
         device=device
     ).to(device)
     
-    criterion = (nn.CrossEntropyLoss() if args.task == 'classification' 
+    criterion = (nn.CrossEntropyLoss() if args.task_type == 'classification' 
                 else nn.MSELoss())
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     
@@ -441,9 +531,6 @@ if __name__ == '__main__':
     loss_acc = 0.0
     accuracy_acc = 0.0
     n_steps_since_log = 0
-    
-    task = DataGenerator(args.n_features, args.n_classes, args.task)
-    task_iterator = task.get_iterator(args.batch_size)
     
     while step < args.total_steps:
         # Generate batch of data
