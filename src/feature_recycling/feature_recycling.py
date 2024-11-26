@@ -264,8 +264,8 @@ class FeatureRecycler:
         weight_norms = torch.norm(first_layer_weights, p=1, dim=0)
         
         stats = {
-            'avg_lifespan_real': np.mean([current_step - f.last_update for f in real_features]) if real_features else 0,
-            'avg_lifespan_distractor': np.mean([current_step - f.last_update for f in distractor_features]) if distractor_features else 0,
+            'avg_lifespan_real': np.mean([current_step - f.creation_step for f in real_features]) if real_features else 0,
+            'avg_lifespan_distractor': np.mean([current_step - f.creation_step for f in distractor_features]) if distractor_features else 0,
             'num_real_features': len(real_features),
             'num_distractor_features': len(distractor_features),
             'total_recycled_features': self.total_recycled,
