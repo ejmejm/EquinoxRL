@@ -1,8 +1,8 @@
-import argparse
 from dataclasses import dataclass
+import math
 import os
 import random
-from typing import Iterator, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -10,6 +10,13 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 import wandb
+import hydra
+import omegaconf
+from omegaconf import DictConfig
+
+from adam import Adam
+from idbd import IDBD
+from tasks import DummyTask, GEOFFTask
 
 
 @dataclass
@@ -21,99 +28,12 @@ class FeatureInfo:
     last_update: int
     creation_step: int
 
-class DummyTask:
-    def __init__(self, feature_dim: int, n_classes: int, task_type: str = 'classification'):
-        """Initialize data generator.
-        
-        Args:
-            feature_dim: Number of input features
-            n_classes: Number of classes for classification
-            task_type: Type of task ('classification' or 'regression')
-        """
-        self.feature_dim = feature_dim
-        self.n_classes = n_classes
-        self.task_type = task_type
-        
-        # Set distributions for each feature
-        self.distributions = [random.choice(['uniform', 'normal']) 
-                            for _ in range(feature_dim)]
 
-    def get_iterator(self, batch_size: int) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        """Get iterator that generates infinite batches of data."""
-        while True:
-            # Generate features
-            features = []
-            for dist in self.distributions:
-                if dist == 'uniform':
-                    feature = torch.rand(batch_size) * 2 - 1  # Uniform in [-1, 1]
-                else:
-                    feature = torch.randn(batch_size).clamp(-1, 1)  # Normal clamped to [-1, 1]
-                features.append(feature)
-            
-            inputs = torch.stack(features, dim=1)
-            
-            # Generate targets
-            if self.task_type == 'classification':
-                targets = torch.randint(0, self.n_classes, (batch_size,))
-            else:
-                targets = torch.randn(batch_size)
-            
-            yield inputs, targets
-
-
-class GEOFFTask:
+class MLP(nn.Module):
     def __init__(
         self, 
-        feature_dim: int = 20, 
-        sign_flip_interval: int = 20,
-        active_features: int = 5,
-    ):
-        """Initialize tracking task where target is sum of first k inputs with changing signs.
-        
-        Args:
-            feature_dim: Number of input features (default 20)
-            sign_flip_interval: How often to flip signs (in steps)
-            active_features: Number of features that contribute to target (default 5)
-        """
-        self.feature_dim = feature_dim
-        self.sign_flip_interval = sign_flip_interval
-        self.active_features = active_features
-        
-        # Initialize signs randomly for active features (+1 or -1)
-        self.signs = torch.randint(0, 2, (active_features,)) * 2 - 1
-        
-        self.steps_since_flip = 0
-        self.task_type = 'regression'
-    
-    def _randomize_sign(self):
-        """Randomly flip the sign of one random feature."""
-        # Choose random feature to flip
-        feature_to_flip = random.randrange(self.active_features)
-        # Flip its sign
-        self.signs[feature_to_flip] *= -1
-    
-    def get_iterator(self, batch_size: int) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        """Get iterator that generates infinite batches of data."""
-        while True:
-            # Generate all features from normal distribution
-            inputs = torch.randn(batch_size, self.feature_dim)
-            # Calculate target using only first k features with signs
-            targets = (self.signs.unsqueeze(0) * inputs[:, :self.active_features]).sum(dim=1)
-            
-            # Update sign flip counter and flip if needed
-            self.steps_since_flip += 1
-            if self.sign_flip_interval > 0 and self.steps_since_flip >= self.sign_flip_interval:
-                self._randomize_sign()
-                self.steps_since_flip = 0
-            
-            yield inputs, targets
-
-
-class RecyclingMLP(nn.Module):
-    def __init__(
-        self, 
-        input_size: int,
-        n_classes: int,
+        input_dim: int,
+        output_dim: int,
         n_layers: int,
         hidden_dim: int,
         weight_init_method: str,
@@ -121,8 +41,8 @@ class RecyclingMLP(nn.Module):
     ):
         """
         Args:
-            input_size: Number of input features
-            n_classes: Number of output classes
+            input_dim: Number of input features
+            output_dim: Number of output classes
             n_layers: Number of layers (including output)
             hidden_dim: Size of hidden layers
             weight_init_method: How to initialize weights ('zeros' or 'kaiming')
@@ -130,19 +50,19 @@ class RecyclingMLP(nn.Module):
             device: Device to put model on
         """
         super().__init__()
-        self.input_size = input_size
-        self.n_classes = n_classes
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         self.device = device
         
         # Build layers
         self.layers = nn.ModuleList()
         if n_layers == 1:
-            self.layers.append(nn.Linear(input_size, n_classes))
+            self.layers.append(nn.Linear(input_dim, output_dim, bias=False))
         else:
-            self.layers.append(nn.Linear(input_size, hidden_dim))
+            self.layers.append(nn.Linear(input_dim, hidden_dim, bias=False))
             for _ in range(n_layers - 2):
                 self.layers.append(nn.Linear(hidden_dim, hidden_dim))
-            self.layers.append(nn.Linear(hidden_dim, n_classes))
+            self.layers.append(nn.Linear(hidden_dim, output_dim))
             
         self.activation = nn.ReLU()
         
@@ -154,11 +74,15 @@ class RecyclingMLP(nn.Module):
         layer = self.layers[0]
         if method == 'zeros':
             nn.init.zeros_(layer.weight)
-            nn.init.zeros_(layer.bias)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
         elif method == 'kaiming':
             nn.init.kaiming_normal_(layer.weight)
-            nn.init.zeros_(layer.bias)
-    
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
+        else:
+            raise ValueError(f'Invalid weight initialization method: {method}')
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers[:-1]:
             x = self.activation(layer(x))
@@ -326,7 +250,7 @@ class FeatureRecycler:
         else:
             return random.sample(eligible_features, min(n_recycle, len(eligible_features)))
 
-    def get_statistics(self, current_step: int, model: RecyclingMLP) -> dict:
+    def get_statistics(self, current_step: int, model: MLP) -> dict:
         """Calculate statistics about current features."""
         real_features = [f for f in self.features.values() if f.is_real]
         distractor_features = [f for f in self.features.values() if not f.is_real]
@@ -360,7 +284,7 @@ class FeatureRecycler:
         real_features: torch.Tensor,
         first_layer_weights: torch.Tensor,
         step_num: int
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, List[int]]:
         """
         Perform one step of feature recycling and return feature values.
         
@@ -372,6 +296,7 @@ class FeatureRecycler:
         
         Returns:
             Tensor of feature values to use for this step
+            List of indices of features that were recycled
         """
         # Generate current feature values
         feature_values = self._generate_feature_values(batch_size, real_features)
@@ -386,22 +311,75 @@ class FeatureRecycler:
         for idx in recycled_features:
             self._add_new_feature(idx, step_num)
         
-        return feature_values
+        return feature_values, recycled_features
 
 
-def prepare_task(args: argparse.Namespace):
-    if args.task == 'dummy':
-        return DummyTask(args.n_features, args.n_classes, args.task_type)
-    elif args.task == 'static_linear_geoff':
+def reset_feature_weights(idxs: Union[int, Sequence[int]], model: MLP, optimizer: optim.Optimizer, cfg: DictConfig):
+    """Reset the weights and associated optimizer state for a feature."""
+    if isinstance(idxs, Sequence) and len(idxs) == 0:
+        return
+    
+    first_layer = model.layers[0]
+    
+    # Reset weights
+    if cfg.model.weight_init_method == 'zeros':
+        with torch.no_grad():
+            first_layer.weight[:, idxs] = 0
+    elif cfg.model.weight_init_method == 'kaiming_uniform':
+        fan = first_layer.weight.shape[1] # fan_in
+        gain = 1
+        std = gain / math.sqrt(fan)
+        bound = math.sqrt(3.0) * std  # Calculate uniform bounds from standard deviation
+        with torch.no_grad():
+            first_layer.weight[:, idxs] = first_layer.weight[:, idxs].uniform_(-bound, bound)
+    else:
+        raise ValueError(f'Invalid weight initialization method: {cfg.model.weight_init_method}')
+
+    # Reset optimizer states
+    if isinstance(optimizer, Adam):
+        # Reset Adam state for the specific feature
+        state = optimizer.state[first_layer.weight]
+        if len(state) > 0: # State is only populated after the first call to step
+            state['step'][:, idxs] = 0
+            state['exp_avg'][:, idxs] = 0
+            state['exp_avg_sq'][:, idxs] = 0
+            if 'max_exp_avg_sq' in state:  # For AMSGrad
+                state['max_exp_avg_sq'][:, idxs] = 0
+    elif isinstance(optimizer, IDBD):
+        state = optimizer.state[first_layer.weight]
+        state['beta'][:, idxs] = math.log(cfg.train.learning_rate)
+        state['h'][:, idxs] = 0
+    else:
+        raise ValueError(f'Invalid optimizer type: {type(optimizer)}')
+
+
+def prepare_task(cfg: DictConfig):
+    """Prepare the task based on configuration."""
+    if cfg.task.name.lower() == 'dummy':
+        return DummyTask(cfg.task.n_features, cfg.model.output_dim, cfg.task.type)
+    elif cfg.task.name.lower() == 'static_linear_geoff':
         # Non-stochastic version of the 1-layer GEOFF task
-        args.n_classes = 1
-        args.task_type = 'regression'
-        return GEOFFTask(args.n_real_features, -1, args.n_real_features)
-    elif args.task == 'linear_geoff':
+        cfg.model.output_dim = 1
+        cfg.task.type = 'regression'
+        return GEOFFTask(cfg.task.n_real_features, -1, cfg.task.n_real_features, seed=cfg.seed)
+    elif cfg.task.name.lower() == 'linear_geoff':
         # Stochastic version of the 1-layer GEOFF task
-        args.n_classes = 1
-        args.task_type = 'regression'
-        return GEOFFTask(args.n_real_features, 20, args.n_real_features)
+        cfg.model.output_dim = 1
+        cfg.task.type = 'regression'
+        return GEOFFTask(cfg.task.n_real_features, 20, cfg.task.n_real_features, seed=cfg.seed)
+
+
+def prepare_optimizer(model: nn.Module, cfg: DictConfig):
+    """Prepare the optimizer based on configuration."""
+    if cfg.train.optimizer == 'adam':
+        return Adam(model.parameters(), lr=cfg.train.learning_rate)
+    elif cfg.train.optimizer == 'idbd':
+        return IDBD(
+            model.parameters(),
+            init_lr=cfg.train.learning_rate,
+            meta_lr=cfg.idbd.meta_learning_rate,
+            trace_diagonal_approx=cfg.idbd.diagonal_approx
+        )
 
 
 def set_seed(seed: Optional[int]):
@@ -415,135 +393,74 @@ def set_seed(seed: Optional[int]):
         torch.backends.cudnn.benchmark = False
 
 
-def parse_arguments() -> argparse.Namespace:
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Feature Recycling Experiment")
+@hydra.main(config_path='conf', config_name='defaults')
+def main(cfg: DictConfig) -> None:
+    """Run the feature recycling experiment."""
+    wandb.config = omegaconf.OmegaConf.to_container(
+        cfg, resolve=True, throw_on_missing=True)
+        
+    set_seed(cfg.seed)
     
-    # Dataset parameters
-    parser.add_argument('--task_type', type=str, default='classification',
-                      choices=['classification', 'regression'],
-                      help='Type of task to perform')
-    parser.add_argument('--n_classes', type=int, default=10,
-                      help='Number of classes for classification')
-    
-    # Feature recycling parameters
-    parser.add_argument('--n_features', type=int, default=100,
-                      help='Total number of features model receives')
-    parser.add_argument('--n_real_features', type=int, default=50,
-                      help='Number of real features available')
-    parser.add_argument('--distractor_chance', type=float, default=0.5,
-                      help='Chance of selecting distractor vs real feature')
-    parser.add_argument('--recycle_rate', type=float, default=0.1,
-                      help='How many features to recycle per step')
-    
-    # Model parameters
-    parser.add_argument('--use_cbp_utility', action='store_true',
-                      help='Whether to use CBP utility for feature selection')
-    parser.add_argument('--utility_decay', type=float, default=0.99,
-                      help='Decay rate for feature utility')
-    parser.add_argument('--weight_init_method', type=str, default='kaiming',
-                      choices=['zeros', 'kaiming'],
-                      help='How to initialize weights in the first layer')
-    parser.add_argument('--n_layers', type=int, default=1,
-                      help='Number of layers in the model')
-    # Add hidden_dim parameter
-    parser.add_argument('--hidden_dim', type=int, default=256,
-                      help='Size of hidden layers')
-    
-    # Training parameters
-    parser.add_argument('--batch_size', type=int, default=32,
-                      help='Batch size for training')
-    parser.add_argument('--learning_rate', type=float, default=0.001,
-                      help='Learning rate')
-    parser.add_argument('--total_steps', type=int, default=10000,
-                      help='Total number of training steps')
-    
-    # IDBD parameters (to be implemented later)
-    parser.add_argument('--init_step_size', type=float, default=0.1,
-                      help='Initial step size for IDBD')
-    parser.add_argument('--use_idbd', action='store_true',
-                      help='Whether to use IDBD')
-    
-    # Task parameters
-    parser.add_argument('--task', type=str,
-                      choices=['dummy', 'static_linear_geoff', 'linear_geoff'],
-                      help='Type of task to perform')
-    
-    # Other parameters
-    parser.add_argument('--seed', type=int, default=None,
-                      help='Random seed for reproducibility')
-    parser.add_argument('--log_freq', type=int, default=100,
-                      help='How often to log statistics')
-    parser.add_argument('--feature_protection_steps', type=int, default=100,
-                      help='Number of steps to protect new features')
-    parser.add_argument('--wandb', action='store_true',
-                      help='Whether to log to wandb')
-    
-    return parser.parse_args()
-
-
-if __name__ == '__main__':
-    args = parse_arguments()
-    set_seed(args.seed)
-    
-    if not args.wandb:
+    if not cfg.wandb:
         os.environ['WANDB_DISABLED'] = 'true'
     
     # Initialize wandb
-    wandb.init(project='feature-recycling', config=vars(args))
+    wandb.init(project=cfg.project)
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    task = prepare_task(args)
-    task_iterator = task.get_iterator(args.batch_size)
+    task = prepare_task(cfg)
+    task_iterator = task.get_iterator(cfg.train.batch_size)
     
     # Initialize model and optimizer
-    model = RecyclingMLP(
-        input_size=args.n_features,
-        n_classes=args.n_classes,
-        n_layers=args.n_layers,
-        hidden_dim=args.hidden_dim,
-        weight_init_method=args.weight_init_method,
-        device=device
-    ).to(device)
+    model = MLP(
+        input_dim=cfg.task.n_features,
+        output_dim=cfg.model.output_dim,
+        n_layers=cfg.model.n_layers,
+        hidden_dim=cfg.model.hidden_dim,
+        weight_init_method=cfg.model.weight_init_method,
+        device=cfg.device
+    ).to(cfg.device)
     
-    criterion = (nn.CrossEntropyLoss() if args.task_type == 'classification' 
+    criterion = (nn.CrossEntropyLoss() if cfg.task.type == 'classification' 
                 else nn.MSELoss())
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = prepare_optimizer(model, cfg)
     
     # Initialize feature recycler
     recycler = FeatureRecycler(
-        n_features=args.n_features,
-        n_real_features=args.n_real_features,
-        distractor_chance=args.distractor_chance,
-        recycle_rate=args.recycle_rate,
-        utility_decay=args.utility_decay,
-        use_cbp_utility=args.use_cbp_utility,
-        feature_protection_steps=args.feature_protection_steps,
-        device=device
+        n_features=cfg.task.n_features,
+        n_real_features=cfg.task.n_real_features,
+        distractor_chance=cfg.feature_recycling.distractor_chance,
+        recycle_rate=cfg.feature_recycling.recycle_rate,
+        utility_decay=cfg.feature_recycling.utility_decay,
+        use_cbp_utility=cfg.feature_recycling.use_cbp_utility,
+        feature_protection_steps=cfg.feature_recycling.feature_protection_steps,
+        device=cfg.device
     )
     
     # Training loop
     step = 0
-    pbar = tqdm(total=args.total_steps, desc="Training")
+    pbar = tqdm(total=cfg.train.total_steps, desc='Training')
     
     # Initialize accumulators
+    cumulative_loss = np.float128(0.0)
     loss_acc = 0.0
     accuracy_acc = 0.0
     n_steps_since_log = 0
     
-    while step < args.total_steps:
+    while step < cfg.train.total_steps:
         # Generate batch of data
         inputs, targets = next(task_iterator)
-        inputs, targets = inputs.to(device), targets.to(device)
+        inputs, targets = inputs.to(cfg.device), targets.to(cfg.device)
         
         # Get recycled features
-        features = recycler.step(
+        features, recycled_features = recycler.step(
             batch_size=inputs.size(0),
             real_features=inputs,
             first_layer_weights=model.get_first_layer_weights(),
             step_num=step
         )
+
+        # Reset weights and optimizer states for recycled features
+        reset_feature_weights(recycled_features, model, optimizer, cfg)
         
         # Forward pass
         outputs = model(features)
@@ -551,11 +468,12 @@ if __name__ == '__main__':
         
         # Backward pass
         optimizer.zero_grad()
-        loss.backward()
+        loss.backward(create_graph=isinstance(optimizer, IDBD))
         optimizer.step()
         
         # Accumulate metrics
         loss_acc += loss.item()
+        cumulative_loss += loss.item()
         n_steps_since_log += 1
         
         # Calculate and accumulate accuracy for classification
@@ -565,15 +483,19 @@ if __name__ == '__main__':
             accuracy_acc += accuracy
         
         # Log metrics
-        if step % args.log_freq == 0:
+        if step % cfg.train.log_freq == 0:
             metrics = {
                 'step': step,
+                'samples': step * cfg.train.batch_size,
                 'loss': loss_acc / n_steps_since_log,
+                'cumulative_loss': cumulative_loss,
                 'accuracy': accuracy_acc / n_steps_since_log if isinstance(criterion, nn.CrossEntropyLoss) else None
             }
             # Add recycler statistics
             metrics.update(recycler.get_statistics(step, model))
             wandb.log(metrics)
+            
+            pbar.set_postfix(loss=metrics['loss'], accuracy=metrics['accuracy'])
             
             # Reset accumulators
             loss_acc = 0.0
@@ -585,3 +507,7 @@ if __name__ == '__main__':
     
     pbar.close()
     wandb.finish()
+
+
+if __name__ == '__main__':
+    main()

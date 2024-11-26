@@ -84,7 +84,7 @@ class IDBD(Optimizer):
                 try:
                     if self.trace_diagonal_approx:
                         # Create a diagonal mask to extract only diagonal elements of the Hessian
-                        mask = torch.eye(grad.numel()).reshape(grad.numel(), *grad.shape)
+                        mask = torch.eye(grad.numel(), device=grad.device).reshape(grad.numel(), *grad.shape)
                         second_order_grad = torch.autograd.grad(
                             grad, p, grad_outputs=mask, is_grads_batched=True, retain_graph=True)[0]
                         second_order_grad = (second_order_grad * mask).sum(0)

@@ -1,0 +1,58 @@
+program: feature_recycling.py
+method: grid
+
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+
+
+metric:
+  name: cumulative_loss
+  goal: minimize
+
+
+parameters:
+  wandb:
+    value: True
+  device:
+    value: cpu
+  project:
+    value: feature-recycling-hyper-search
+  
+  task.name:
+    value: linear_geoff
+  task.type:
+    value: regression
+  task.n_features:
+    value: 100
+  task.n_real_features:
+    value: 10
+
+  feature_recycling.distractor_chance:
+    value: 0.95
+  feature_recycling.recycle_rate:
+    value: 0.5
+  feature_recycling.use_cbp_utility:
+    value: false
+
+  train.optimizer:
+    value: adam
+  train.batch_size:
+    value: 1
+  train.total_steps:
+    value: 5000
+  train.log_freq:
+    value: 100
+
+  model.n_layers:
+    value: 1
+
+  train.learning_rate:
+    values: [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+  model.weight_init_method:
+    values: [zeros, kaiming_uniform]
+  seed:
+    values: [1, 2, 3]
