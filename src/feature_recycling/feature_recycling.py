@@ -76,8 +76,8 @@ class MLP(nn.Module):
             nn.init.zeros_(layer.weight)
             if layer.bias is not None:
                 nn.init.zeros_(layer.bias)
-        elif method == 'kaiming':
-            nn.init.kaiming_normal_(layer.weight)
+        elif method == 'kaiming_uniform':
+            nn.init.kaiming_uniform_(layer.weight)
             if layer.bias is not None:
                 nn.init.zeros_(layer.bias)
         else:
@@ -188,8 +188,17 @@ class FeatureRecycler:
     
     def _generate_feature_values(self, batch_size: int, real_features: torch.Tensor) -> torch.Tensor:
         """Generate feature values for the current feature set."""
-        values = torch.zeros(batch_size, self.n_features, device=self.device)
+        values = torch.zeros(batch_size, self.n_features)
         
+        # Initialize arrays for distractor indices
+        uniform_indices = []
+        normal_indices = []
+        uniform_lows = []
+        uniform_highs = []
+        normal_means = []
+        normal_stds = []
+        
+        # Single loop to handle all features
         for i in range(self.n_features):
             if self.features[i].is_real:
                 feature_idx = self.features[i].distribution_params['feature_idx']
@@ -197,9 +206,33 @@ class FeatureRecycler:
             else:
                 params = self.features[i].distribution_params
                 if params['distribution'] == 'uniform':
-                    values[:, i] = torch.rand(batch_size, device=self.device) * (params['high'] - params['low']) + params['low']
+                    uniform_indices.append(i)
+                    uniform_lows.append(params['low'])
+                    uniform_highs.append(params['high'])
                 else:  # normal
-                    values[:, i] = torch.normal(params['mean'], params['std'], size=(batch_size,), device=self.device).clamp(-1, 1)
+                    normal_indices.append(i)
+                    normal_means.append(params['mean'])
+                    normal_stds.append(params['std'])
+        
+        # Handle uniform distractors in batch
+        if uniform_indices:
+            lows = torch.tensor(uniform_lows)
+            highs = torch.tensor(uniform_highs)
+            
+            uniform_values = torch.rand(batch_size, len(uniform_indices))
+            uniform_values = uniform_values * (highs - lows) + lows
+            values[:, uniform_indices] = uniform_values
+            
+        # Handle normal distractors in batch
+        if normal_indices:
+            means = torch.tensor(normal_means)
+            stds = torch.tensor(normal_stds)
+            
+            eps = torch.randn(batch_size, len(normal_indices))
+            normal_values = (means + eps * stds).clamp(-1, 1)
+            values[:, normal_indices] = normal_values
+            
+        values = values.to(self.device)
         
         return values
     
@@ -215,15 +248,13 @@ class FeatureRecycler:
             
         weight_norms = torch.norm(first_layer_weights, p=1, dim=0)
         feature_impacts = torch.abs(feature_values) * weight_norms
+        feature_impacts = feature_impacts.mean(dim=0).detach().cpu().numpy()
+        old_utilities = np.array([self.features[i].utility for i in range(self.n_features)])
+        new_utilities = self.utility_decay * old_utilities + (1 - self.utility_decay) * feature_impacts
         
         # Update running averages
         for i in range(self.n_features):
-            impact = feature_impacts[:, i].mean().item()
-            old_utility = self.features[i].utility
-            self.features[i].utility = (
-                self.utility_decay * old_utility + 
-                (1 - self.utility_decay) * impact
-            )
+            self.features[i].utility = new_utilities[i]
             self.features[i].last_update = step
     
     def get_features_to_recycle(self, current_step: int) -> list:
@@ -250,7 +281,7 @@ class FeatureRecycler:
         else:
             return random.sample(eligible_features, min(n_recycle, len(eligible_features)))
 
-    def get_statistics(self, current_step: int, model: MLP) -> dict:
+    def get_statistics(self, current_step: int, model: MLP, optimizer: optim.Optimizer) -> dict:
         """Calculate statistics about current features."""
         real_features = [f for f in self.features.values() if f.is_real]
         distractor_features = [f for f in self.features.values() if not f.is_real]
@@ -272,9 +303,44 @@ class FeatureRecycler:
             'mean_weight_norm_real': weight_norms[real_indices].mean().item() if real_indices else 0,
             'mean_weight_norm_distractor': weight_norms[distractor_indices].mean().item() if distractor_indices else 0
         }
+        
         if self.use_cbp_utility:
             stats['mean_utility_real'] = np.mean([f.utility for f in real_features]) if real_features else 0
             stats['mean_utility_distractor'] = np.mean([f.utility for f in distractor_features]) if distractor_features else 0
+            
+        if isinstance(optimizer, IDBD):
+            first_layer = model.layers[0]
+            idbd_beta = optimizer.state[first_layer.weight]['beta']
+            learning_rates = torch.exp(idbd_beta).mean(dim=0)
+            stats['mean_learning_rate_real'] = learning_rates[real_indices].mean().item() if real_indices else 0
+            stats['mean_learning_rate_distractor'] = learning_rates[distractor_indices].mean().item() if distractor_indices else 0
+            
+        elif isinstance(optimizer, Adam):
+            first_layer = model.layers[0]
+            state = optimizer.state[first_layer.weight]
+            
+            # Get Adam parameters
+            step = state['step']
+            exp_avg_sq = state['exp_avg_sq']
+            beta1, beta2 = optimizer.defaults['betas']
+            lr = optimizer.defaults['lr']
+            eps = optimizer.defaults['eps']
+            
+            # Calculate bias corrections
+            bias_correction1 = 1 - beta1 ** step
+            bias_correction2 = 1 - beta2 ** step
+            
+            # Calculate step size
+            step_size = lr / bias_correction1
+            
+            # Calculate denominator
+            denom = (exp_avg_sq.sqrt() / bias_correction2.sqrt()).add_(eps)
+            
+            # Calculate effective learning rates
+            effective_lrs = (step_size / denom).mean(dim=0)
+            
+            stats['mean_learning_rate_real'] = effective_lrs[real_indices].mean().item() if real_indices else 0
+            stats['mean_learning_rate_distractor'] = effective_lrs[distractor_indices].mean().item() if distractor_indices else 0
         
         return stats
     
@@ -372,13 +438,25 @@ def prepare_task(cfg: DictConfig):
 def prepare_optimizer(model: nn.Module, cfg: DictConfig):
     """Prepare the optimizer based on configuration."""
     if cfg.train.optimizer == 'adam':
-        return Adam(model.parameters(), lr=cfg.train.learning_rate)
+        return Adam(
+            model.parameters(),
+            lr=cfg.train.learning_rate,
+            weight_decay=cfg.train.weight_decay,
+        )
+    elif cfg.train.optimizer == 'rmsprop':
+        return Adam(
+            model.parameters(),
+            lr=cfg.train.learning_rate,
+            betas=(0, 0.999),
+            weight_decay=cfg.train.weight_decay,
+        )
     elif cfg.train.optimizer == 'idbd':
         return IDBD(
             model.parameters(),
             init_lr=cfg.train.learning_rate,
             meta_lr=cfg.idbd.meta_learning_rate,
-            trace_diagonal_approx=cfg.idbd.diagonal_approx
+            trace_diagonal_approx=cfg.idbd.diagonal_approx,
+            weight_decay=cfg.train.weight_decay,
         )
 
 
@@ -492,7 +570,7 @@ def main(cfg: DictConfig) -> None:
                 'accuracy': accuracy_acc / n_steps_since_log if isinstance(criterion, nn.CrossEntropyLoss) else None
             }
             # Add recycler statistics
-            metrics.update(recycler.get_statistics(step, model))
+            metrics.update(recycler.get_statistics(step, model, optimizer))
             wandb.log(metrics)
             
             pbar.set_postfix(loss=metrics['loss'], accuracy=metrics['accuracy'])

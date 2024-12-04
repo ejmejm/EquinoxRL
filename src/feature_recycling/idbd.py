@@ -23,10 +23,12 @@ class IDBD(Optimizer):
         params: Iterator[torch.Tensor],
         meta_lr: float = 0.01,
         init_lr: float = 0.01,
+        weight_decay: float = 0.0,
         trace_diagonal_approx: bool = True,
     ):
         defaults = dict(meta_lr=meta_lr)
         super().__init__(params, defaults)
+        self.weight_decay = weight_decay
         self.trace_diagonal_approx = trace_diagonal_approx
 
         # Initialize beta and h for each parameter
@@ -77,7 +79,8 @@ class IDBD(Optimizer):
                 alpha = torch.exp(beta)
                 
                 # Queue paramter update
-                param_update = -alpha * grad
+                weight_decay_term = self.weight_decay * p.data if self.weight_decay != 0 else 0
+                param_update = -alpha * (grad + weight_decay_term)
                 param_updates.append((p, param_update))
                 
                 # Calculate second order grad for h
