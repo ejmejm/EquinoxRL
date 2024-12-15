@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import math
 import os
 import random
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -16,7 +16,8 @@ from omegaconf import DictConfig
 
 from adam import Adam
 from idbd import IDBD
-from tasks import DummyTask, GEOFFTask
+from models import MLP
+from tasks import DummyTask, GEOFFTask, NonlinearGEOFFTask
 
 
 @dataclass
@@ -24,73 +25,9 @@ class FeatureInfo:
     """Stores information about a feature including its utility and distribution parameters."""
     is_real: bool
     utility: float
-    distribution_params: dict
+    distribution_params: Dict[str, Any]
     last_update: int
     creation_step: int
-
-
-class MLP(nn.Module):
-    def __init__(
-        self, 
-        input_dim: int,
-        output_dim: int,
-        n_layers: int,
-        hidden_dim: int,
-        weight_init_method: str,
-        device: str = 'cuda'
-    ):
-        """
-        Args:
-            input_dim: Number of input features
-            output_dim: Number of output classes
-            n_layers: Number of layers (including output)
-            hidden_dim: Size of hidden layers
-            weight_init_method: How to initialize weights ('zeros' or 'kaiming')
-            sample_with_replacement: Whether to sample real features with replacement
-            device: Device to put model on
-        """
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.device = device
-        
-        # Build layers
-        self.layers = nn.ModuleList()
-        if n_layers == 1:
-            self.layers.append(nn.Linear(input_dim, output_dim, bias=False))
-        else:
-            self.layers.append(nn.Linear(input_dim, hidden_dim, bias=False))
-            for _ in range(n_layers - 2):
-                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
-            self.layers.append(nn.Linear(hidden_dim, output_dim))
-            
-        self.activation = nn.ReLU()
-        
-        # Initialize weights
-        self._initialize_weights(weight_init_method)
-    
-    def _initialize_weights(self, method: str):
-        """Initialize weights according to specified method."""
-        layer = self.layers[0]
-        if method == 'zeros':
-            nn.init.zeros_(layer.weight)
-            if layer.bias is not None:
-                nn.init.zeros_(layer.bias)
-        elif method == 'kaiming_uniform':
-            nn.init.kaiming_uniform_(layer.weight)
-            if layer.bias is not None:
-                nn.init.zeros_(layer.bias)
-        else:
-            raise ValueError(f'Invalid weight initialization method: {method}')
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers[:-1]:
-            x = self.activation(layer(x))
-        return self.layers[-1](x)
-    
-    def get_first_layer_weights(self) -> torch.Tensor:
-        """Returns the weights of the first layer for utility calculation."""
-        return self.layers[0].weight
 
 
 class FeatureRecycler:
@@ -433,6 +370,17 @@ def prepare_task(cfg: DictConfig):
         cfg.model.output_dim = 1
         cfg.task.type = 'regression'
         return GEOFFTask(cfg.task.n_real_features, 20, cfg.task.n_real_features, seed=cfg.seed)
+    elif cfg.task.name.lower() == 'nonlinear_geoff':
+        cfg.model.output_dim = 1
+        cfg.task.type = 'regression'
+        return NonlinearGEOFFTask(
+            n_features=cfg.task.n_real_features,
+            flip_rate=cfg.task.flip_rate,
+            n_layers=cfg.task.n_layers,
+            hidden_dim=cfg.task.hidden_dim,
+            weight_scale=cfg.task.weight_scale,
+            activation=cfg.task.activation,
+        )
 
 
 def prepare_optimizer(model: nn.Module, cfg: DictConfig):
@@ -495,6 +443,7 @@ def main(cfg: DictConfig) -> None:
         n_layers=cfg.model.n_layers,
         hidden_dim=cfg.model.hidden_dim,
         weight_init_method=cfg.model.weight_init_method,
+        activation=cfg.model.activation,
         device=cfg.device
     ).to(cfg.device)
     
@@ -567,7 +516,8 @@ def main(cfg: DictConfig) -> None:
                 'samples': step * cfg.train.batch_size,
                 'loss': loss_acc / n_steps_since_log,
                 'cumulative_loss': cumulative_loss,
-                'accuracy': accuracy_acc / n_steps_since_log if isinstance(criterion, nn.CrossEntropyLoss) else None
+                'accuracy': accuracy_acc / n_steps_since_log if isinstance(criterion, nn.CrossEntropyLoss) else None,
+                'squared_targets': targets.square().mean().item(),
             }
             # Add recycler statistics
             metrics.update(recycler.get_statistics(step, model, optimizer))

@@ -2,6 +2,7 @@ import random
 from typing import Iterator, Optional, Tuple
 
 import torch
+import numpy as np
 
 
 class DummyTask:
@@ -95,3 +96,127 @@ class GEOFFTask:
                 self.steps_since_flip = 0
             
             yield inputs, targets.unsqueeze(1)
+
+
+class NonlinearGEOFFTask:
+    """Non-linear version of GEOFF task with configurable depth and activation."""
+    
+    def __init__(
+        self,
+        n_features: int,
+        flip_rate: float,  # Percentage of weights to flip per step
+        n_layers: int = 2,
+        hidden_dim: int = 64,
+        weight_scale: float = 1.0,
+        activation: str = 'relu',
+        seed: Optional[int] = None
+    ):
+        """
+        Args:
+            n_features: Number of input features
+            flip_rate: Percentage of weights to flip per step (accumulates if < 1 weight)
+            n_layers: Number of layers in the target network (1 = linear)
+            hidden_dim: Hidden dimension size for intermediate layers
+            weight_scale: Scale factor for weights (weights will be ±scale)
+            activation: Activation function ('relu', 'tanh', or 'sigmoid')
+            seed: Random seed for reproducibility
+        """
+        self.n_features = n_features
+        self.n_layers = n_layers
+        self.hidden_dim = hidden_dim
+        self.weight_scale = weight_scale
+        self.flip_rate = flip_rate
+        self.flip_accumulators = []  # Accumulate flip probability for each layer
+        
+        if seed is not None:
+            torch.manual_seed(seed)
+            
+        # Set activation function
+        if activation == 'relu':
+            self.activation_fn = torch.nn.ReLU()
+        elif activation == 'tanh':
+            self.activation_fn = torch.nn.Tanh()
+        elif activation == 'sigmoid':
+            self.activation_fn = torch.nn.Sigmoid()
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+            
+        # Initialize network weights
+        self.weights = []
+        
+        if n_layers == 1:
+            # For linear case, single layer mapping input to output
+            layer_weights = (torch.randint(0, 2, (n_features, 1)) * 2 - 1) * weight_scale
+            self.weights.append(layer_weights)
+            self.flip_accumulators.append(flip_rate * n_features)
+        else:
+            # Input layer
+            layer_weights = (torch.randint(0, 2, (n_features, hidden_dim)) * 2 - 1) * weight_scale
+            self.weights.append(layer_weights)
+            
+            # Calculate number of weights that can flip in first layer
+            n_flippable = n_features * hidden_dim
+            self.flip_accumulators.append(flip_rate * n_flippable)
+            
+            # Hidden layers
+            for i in range(n_layers - 2):
+                layer_weights = (torch.randint(0, 2, (hidden_dim, hidden_dim)) * 2 - 1) * weight_scale
+                self.weights.append(layer_weights)
+                
+                # All weights can flip in hidden layers
+                n_flippable = hidden_dim * hidden_dim
+                self.flip_accumulators.append(flip_rate * n_flippable)
+            
+            # Output layer
+            self.weights.append((torch.randint(0, 2, (hidden_dim, 1)) * 2 - 1) * weight_scale)
+            
+            # Output layer flippable weights
+            n_flippable = hidden_dim
+            self.flip_accumulators.append(flip_rate * n_flippable)
+    
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the target network."""
+        if self.n_layers == 1:
+            return x @ self.weights[0]
+            
+        for i in range(self.n_layers - 1):
+            x = x @ self.weights[i]
+            x = self.activation_fn(x)
+        return x @ self.weights[-1]
+    
+    def _flip_signs(self):
+        """Flip signs of weights based on accumulated probabilities."""
+        for layer_idx, (weights, accumulator) in enumerate(zip(self.weights, self.flip_accumulators)):
+            n_flips = int(accumulator)
+            if n_flips > 0:
+                # Randomly select weights to flip
+                flat_idx = torch.randperm(weights.numel())[:n_flips]
+                weights.view(-1)[flat_idx] *= -1
+                
+                # Update accumulator
+                self.flip_accumulators[layer_idx] -= n_flips
+    
+    def get_iterator(self, batch_size: int):
+        """Returns an iterator that generates batches of data."""
+        while True:
+            # Generate random input features
+            x = torch.randn(batch_size, self.n_features)
+            
+            # Forward pass through target network
+            y = self._forward(x)
+            
+            # Accumulate and handle weight flips
+            for i in range(len(self.flip_accumulators)):
+                if self.n_layers == 1:
+                    n_flippable = self.n_features
+                elif i == 0:
+                    n_flippable = self.n_features * self.hidden_dim
+                elif i == len(self.weights) - 1:
+                    n_flippable = self.hidden_dim
+                else:
+                    n_flippable = self.hidden_dim * self.hidden_dim
+                self.flip_accumulators[i] += self.flip_rate * n_flippable
+            
+            self._flip_signs()
+            
+            yield x, y
