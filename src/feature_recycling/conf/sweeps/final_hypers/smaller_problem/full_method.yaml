@@ -1,7 +1,7 @@
 program: feature_recycling.py
 method: grid
 project: feature-recycling-final-hypers
-name: baseline
+name: full_method_20_features
 
 
 command:
@@ -26,8 +26,6 @@ parameters:
     value: linear_geoff
   task.type:
     value: regression
-  task.n_features:
-    value: 100
   task.n_real_features:
     value: 10
 
@@ -36,10 +34,10 @@ parameters:
   feature_recycling.recycle_rate:
     value: 0.5
   feature_recycling.use_cbp_utility:
-    value: false
+    value: true
 
   train.optimizer:
-    value: adam
+    value: idbd
   train.batch_size:
     value: 1
   train.total_steps:
@@ -49,11 +47,19 @@ parameters:
 
   model.n_layers:
     value: 1
-
-  train.learning_rate:
-    value: 0.01
   model.weight_init_method:
     value: zeros
+
+  task.n_features:
+    value: 20
+  feature_recycling.feature_protection_steps:
+    value: 5
+  feature_recycling.utility_decay:
+    value: 0.95
+  idbd.meta_learning_rate:
+    value: 0.005
+  train.learning_rate:
+    value: 0.01
   
   seed:
     values: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]

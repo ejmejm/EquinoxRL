@@ -11,7 +11,7 @@ task:
   name: linear_geoff # dummy, static_linear_geoff, linear_geoff
   type: regression # classification, regression
   n_features: 20
-  n_real_features: 5
+  n_real_features: 10
 
 # Feature recycling parameters
 feature_recycling:
@@ -24,6 +24,7 @@ feature_recycling:
 # Train parameters
 train:
   optimizer: adam # adam, idbd, partial_idbd
+  weight_decay: 0
   batch_size: 1
   learning_rate: 0.001
   total_steps: 10000
@@ -35,6 +36,7 @@ model:
   n_layers: 1
   hidden_dim: 256
   output_dim: 10
+  activation: relu
 
 # IDBD parameters
 idbd:

@@ -1,5 +1,7 @@
 program: feature_recycling.py
-method: bayes
+method: grid
+project: feature-recycling-final-hypers
+name: full_method
 
 
 command:
@@ -19,8 +21,6 @@ parameters:
     value: True
   device:
     value: cpu
-  project:
-    value: feature-recycling-final-hypers
   
   task.name:
     value: linear_geoff
