@@ -33,6 +33,9 @@ class IDBD(Optimizer):
         super().__init__(params, defaults)
         self.weight_decay = weight_decay
         self.version = version
+        
+        assert self.version in ['squared_inputs', 'squared_grads', 'hvp', 'hessian_diagonal'], \
+            f"Invalid version: {self.version}. Must be one of: squared_inputs, squared_grads, hvp, hessian_diagonal."
 
         # Initialize beta and h for each parameter
         for group in self.param_groups:
@@ -47,21 +50,24 @@ class IDBD(Optimizer):
         """Performs a single optimization step.
         
         Args:
-            loss: Loss tensor
-            predictions: Predictions tensor
+            loss: Loss tensor of shape ()
+            predictions: Predictions tensor of shape (batch_size, n_classes)
             param_inputs: Dictionary mapping linear layer weight parameters to their inputs
         """
+        all_params = [p for group in self.param_groups for p in group['params']]
         
-        outputs = [loss, torch.sum(predictions)]
-        # grad_outputs = [torch.ones_like(loss), torch.ones_like(y_hat)]
-
+        if self.version == 'squared_grads':
+            with torch.enable_grad():
+                prediction_sum = torch.sum(predictions)
+            prediction_grads = torch.autograd.grad(
+                outputs = prediction_sum,
+                inputs = all_params,
+                retain_graph = True,
+            )
+            prediction_grads = {p: g for p, g in zip(all_params, prediction_grads)}
+        
         # Compute gradients for all model parameters
-        combined_gradients = torch.autograd.grad(
-            outputs = outputs,
-            inputs = [p for group in self.param_groups for p in group['params']],
-            # grad_outputs=grad_outputs,
-            retain_graph = False,
-        )
+        loss.backward(create_graph=True)
 
         param_updates = []
         for group in self.param_groups:
@@ -71,23 +77,24 @@ class IDBD(Optimizer):
                 if p.grad is None:
                     continue
                 
+                grad = p.grad
+                
                 if p in param_inputs:
                     assert len(param_inputs[p].shape) == 1, "Inputs must be 1D tensors"
                     inputs = param_inputs[p].unsqueeze(0)
-                elif len(p.grad.shape) == 1:
-                    inputs = torch.ones_like(p.grad)
+                elif len(grad.shape) == 1:
+                    inputs = torch.ones_like(grad)
                 else:
                     raise ValueError(f"Parameter {p} not found in activations dictionary.")
-                    
-                grad = p.grad
-                state = self.state[p]
                 
                 # Get state variables
+                state = self.state[p]
                 beta = state['beta']
                 h = state['h']
                 
                 # Update beta
                 beta.add_(meta_lr * grad * h)
+                state['beta'] = beta
                 
                 # Calculate alpha (learning rate)
                 alpha = torch.exp(beta)
@@ -97,33 +104,14 @@ class IDBD(Optimizer):
                 param_update = -alpha * (grad + weight_decay_term)
                 param_updates.append((p, param_update))
                 
-                # Calculate second order grad for h
-                try:
-                    if self.trace_diagonal_approx:
-                        # Create a diagonal mask to extract only diagonal elements of the Hessian
-                        mask = torch.eye(grad.numel(), device=grad.device).reshape(grad.numel(), *grad.shape)
-                        second_order_grad = torch.autograd.grad(
-                            grad, p, grad_outputs=mask, is_grads_batched=True, retain_graph=True)[0]
-                        second_order_grad = (second_order_grad * mask).sum(0)
-                    else:
-                        second_order_grad = torch.autograd.grad(
-                            grad, p, grad_outputs=torch.ones_like(grad), retain_graph=True)[0]
-                except RuntimeError as e:
-                    if "grad and does not have a grad_fn" in str(e):
-                        raise RuntimeError(
-                            "Parameter grads do not have a grad_fn, which is required for IDBD. "
-                            "You can fix this by calling the backward function with "
-                            "create_graph=True [e.g. loss.backward(create_graph=True)]."
-                        )
-                    else:
-                        raise e
+                ## Different h update depending on version ##
                 
                 if self.version == 'squared_inputs':
-                    h = h * (1 - alpha * inputs.pow(2)).clamp(min=0) + alpha * inputs
+                    state['h'] = h * (1 - alpha * inputs.pow(2)).clamp(min=0) + alpha * inputs
                     
                 elif self.version == 'squared_grads':
-                    h = h * (1 - alpha * grad.pow(2)).clamp(min=0) + alpha * grad # TODO: Fix this
-                    
+                    state['h'] = h * (1 - alpha * prediction_grads[p].pow(2)).clamp(min=0) + alpha * grad
+
                 elif self.version == 'hvp':
                     try:
                         second_order_grad = torch.autograd.grad(
@@ -157,12 +145,8 @@ class IDBD(Optimizer):
                             raise e
                     state['h'] = h * (1 - alpha * second_order_grad).clamp(min=0) + alpha * grad
                 
-                # Store updated states
-                state['beta'] = beta
-                
         for p, param_update in param_updates:
             p.add_(param_update)
-            p.grad = None
 
         return loss
     
