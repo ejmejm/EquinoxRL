@@ -109,6 +109,7 @@ class NonlinearGEOFFTask:
         hidden_dim: int = 64,
         weight_scale: float = 1.0,
         activation: str = 'relu',
+        sparsity: float = 0.0,
         seed: Optional[int] = None
     ):
         """
@@ -119,6 +120,7 @@ class NonlinearGEOFFTask:
             hidden_dim: Hidden dimension size for intermediate layers
             weight_scale: Scale factor for weights (weights will be ±scale)
             activation: Activation function ('relu', 'tanh', or 'sigmoid')
+            sparsity: Percentage of weights (other than the last layer) to set to zero
             seed: Random seed for reproducibility
         """
         self.n_features = n_features
@@ -152,6 +154,7 @@ class NonlinearGEOFFTask:
         else:
             # Input layer
             layer_weights = (torch.randint(0, 2, (n_features, hidden_dim)) * 2 - 1) * weight_scale
+            self._sparsify_weights(layer_weights, sparsity)
             self.weights.append(layer_weights)
             
             # Calculate number of weights that can flip in first layer
@@ -161,6 +164,7 @@ class NonlinearGEOFFTask:
             # Hidden layers
             for i in range(n_layers - 2):
                 layer_weights = (torch.randint(0, 2, (hidden_dim, hidden_dim)) * 2 - 1) * weight_scale
+                self._sparsify_weights(layer_weights, sparsity)
                 self.weights.append(layer_weights)
                 
                 # All weights can flip in hidden layers
@@ -168,11 +172,20 @@ class NonlinearGEOFFTask:
                 self.flip_accumulators.append(flip_rate * n_flippable)
             
             # Output layer
-            self.weights.append((torch.randint(0, 2, (hidden_dim, 1)) * 2 - 1) * weight_scale)
+            output_weights = (torch.randint(0, 2, (hidden_dim, 1)) * 2 - 1) * weight_scale
+            self.weights.append(output_weights)
             
             # Output layer flippable weights
             n_flippable = hidden_dim
             self.flip_accumulators.append(flip_rate * n_flippable)
+            
+    def _sparsify_weights(self, weights: torch.Tensor, sparsity: float):
+        """Set a percentage of weights to zero."""
+        if sparsity == 0:
+            return
+        n_zero = int(sparsity * weights.numel())
+        flat_idx = torch.randperm(weights.numel())[:n_zero]
+        weights.view(-1)[flat_idx] = 0
     
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the target network."""

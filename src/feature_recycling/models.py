@@ -65,9 +65,12 @@ class MLP(nn.Module):
             raise ValueError(f'Invalid weight initialization method: {method}')
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        param_inputs = {}
         for layer in self.layers[:-1]:
+            param_inputs[layer.weight] = x
             x = self.activation(layer(x))
-        return self.layers[-1](x)
+        param_inputs[self.layers[-1].weight] = x
+        return self.layers[-1](x), param_inputs
     
     def get_first_layer_weights(self) -> torch.Tensor:
         """Returns the weights of the first layer for utility calculation."""

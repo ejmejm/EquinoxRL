@@ -41,4 +41,4 @@ model:
 # IDBD parameters
 idbd:
   meta_learning_rate: 0.01
-  diagonal_approx: true
+  version: squared_inputs # squared_inputs, squared_grads, hvp, hessian_diagonal

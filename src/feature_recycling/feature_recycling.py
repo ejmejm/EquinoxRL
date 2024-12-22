@@ -15,7 +15,7 @@ import omegaconf
 from omegaconf import DictConfig
 
 from adam import Adam
-from idbd import IDBD
+from idbd import IDBD, RMSPropIDBD
 from models import MLP
 from tasks import DummyTask, GEOFFTask, NonlinearGEOFFTask
 
@@ -245,7 +245,7 @@ class FeatureRecycler:
             stats['mean_utility_real'] = np.mean([f.utility for f in real_features]) if real_features else 0
             stats['mean_utility_distractor'] = np.mean([f.utility for f in distractor_features]) if distractor_features else 0
             
-        if isinstance(optimizer, IDBD):
+        if isinstance(optimizer, (IDBD, RMSPropIDBD)):
             first_layer = model.layers[0]
             idbd_beta = optimizer.state[first_layer.weight]['beta']
             learning_rates = torch.exp(idbd_beta).mean(dim=0)
@@ -380,6 +380,7 @@ def prepare_task(cfg: DictConfig):
             hidden_dim=cfg.task.hidden_dim,
             weight_scale=cfg.task.weight_scale,
             activation=cfg.task.activation,
+            sparsity=cfg.task.sparsity,
         )
 
 
@@ -403,9 +404,19 @@ def prepare_optimizer(model: nn.Module, cfg: DictConfig):
             model.parameters(),
             init_lr=cfg.train.learning_rate,
             meta_lr=cfg.idbd.meta_learning_rate,
+            version=cfg.idbd.version,
+            weight_decay=cfg.train.weight_decay,
+        )
+    elif cfg.train.optimizer == 'rmsprop_idbd':
+        return RMSPropIDBD(
+            model.parameters(),
+            init_lr=cfg.train.learning_rate,
+            meta_lr=cfg.idbd.meta_learning_rate,
             trace_diagonal_approx=cfg.idbd.diagonal_approx,
             weight_decay=cfg.train.weight_decay,
         )
+    else:
+        raise ValueError(f'Invalid optimizer type: {cfg.train.optimizer}')
 
 
 def set_seed(seed: Optional[int]):
@@ -422,16 +433,15 @@ def set_seed(seed: Optional[int]):
 @hydra.main(config_path='conf', config_name='defaults')
 def main(cfg: DictConfig) -> None:
     """Run the feature recycling experiment."""
-    wandb.config = omegaconf.OmegaConf.to_container(
-        cfg, resolve=True, throw_on_missing=True)
-        
     set_seed(cfg.seed)
     
     if not cfg.wandb:
         os.environ['WANDB_DISABLED'] = 'true'
     
     # Initialize wandb
-    wandb.init(project=cfg.project)
+    wandb_config = omegaconf.OmegaConf.to_container(
+        cfg, resolve=True, throw_on_missing=True)
+    wandb.init(project=cfg.project, config=wandb_config)
     
     task = prepare_task(cfg)
     task_iterator = task.get_iterator(cfg.train.batch_size)
@@ -472,10 +482,12 @@ def main(cfg: DictConfig) -> None:
     loss_acc = 0.0
     accuracy_acc = 0.0
     n_steps_since_log = 0
+    target_buffer = []
     
     while step < cfg.train.total_steps:
         # Generate batch of data
         inputs, targets = next(task_iterator)
+        target_buffer.extend(targets.view(-1).tolist())
         inputs, targets = inputs.to(cfg.device), targets.to(cfg.device)
         
         # Get recycled features
@@ -490,13 +502,19 @@ def main(cfg: DictConfig) -> None:
         reset_feature_weights(recycled_features, model, optimizer, cfg)
         
         # Forward pass
-        outputs = model(features)
+        outputs, param_inputs = model(features)
         loss = criterion(outputs, targets)
         
         # Backward pass
         optimizer.zero_grad()
-        loss.backward(create_graph=isinstance(optimizer, IDBD))
-        optimizer.step()
+        loss.backward(create_graph='idbd' in cfg.train.optimizer.lower())
+        if isinstance(optimizer, RMSPropIDBD):
+            # Mean over batch dimension
+            param_inputs = {k: v.mean(dim=0) for k, v in param_inputs.items()}
+            optimizer.step(
+                param_inputs)
+        else:
+            optimizer.step()
         
         # Accumulate metrics
         loss_acc += loss.item()
@@ -517,7 +535,7 @@ def main(cfg: DictConfig) -> None:
                 'loss': loss_acc / n_steps_since_log,
                 'cumulative_loss': cumulative_loss,
                 'accuracy': accuracy_acc / n_steps_since_log if isinstance(criterion, nn.CrossEntropyLoss) else None,
-                'squared_targets': targets.square().mean().item(),
+                'squared_targets': torch.tensor(target_buffer).square().mean().item(),
             }
             # Add recycler statistics
             metrics.update(recycler.get_statistics(step, model, optimizer))
@@ -529,7 +547,8 @@ def main(cfg: DictConfig) -> None:
             loss_acc = 0.0
             accuracy_acc = 0.0
             n_steps_since_log = 0
-        
+            target_buffer = []
+
         step += 1
         pbar.update(1)
     
