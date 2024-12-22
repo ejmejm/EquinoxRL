@@ -399,6 +399,12 @@ def prepare_optimizer(model: nn.Module, cfg: DictConfig):
             betas=(0, 0.999),
             weight_decay=cfg.train.weight_decay,
         )
+    elif cfg.train.optimizer == 'sgd':
+        return optim.SGD(
+            model.parameters(),
+            lr=cfg.train.learning_rate,
+            weight_decay=cfg.train.weight_decay,
+        )
     elif cfg.train.optimizer == 'idbd':
         return IDBD(
             model.parameters(),
@@ -470,7 +476,7 @@ def main(cfg: DictConfig) -> None:
         utility_decay=cfg.feature_recycling.utility_decay,
         use_cbp_utility=cfg.feature_recycling.use_cbp_utility,
         feature_protection_steps=cfg.feature_recycling.feature_protection_steps,
-        device=cfg.device
+        device=cfg.device,
     )
     
     # Training loop
@@ -507,13 +513,17 @@ def main(cfg: DictConfig) -> None:
         
         # Backward pass
         optimizer.zero_grad()
-        loss.backward(create_graph='idbd' in cfg.train.optimizer.lower())
         if isinstance(optimizer, RMSPropIDBD):
+            loss.backward(create_graph=True)
             # Mean over batch dimension
             param_inputs = {k: v.mean(dim=0) for k, v in param_inputs.items()}
-            optimizer.step(
-                param_inputs)
+            optimizer.step(param_inputs)
+        elif isinstance(optimizer, IDBD):
+            # Mean over batch dimension
+            param_inputs = {k: v.mean(dim=0) for k, v in param_inputs.items()}
+            optimizer.step(loss, outputs, param_inputs)
         else:
+            loss.backward()
             optimizer.step()
         
         # Accumulate metrics
