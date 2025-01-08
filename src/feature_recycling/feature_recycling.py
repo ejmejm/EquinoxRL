@@ -568,6 +568,17 @@ def main(cfg: DictConfig) -> None:
             optimizer.step(loss, outputs, param_inputs)
         else:
             loss.backward()
+            with torch.no_grad():
+                delta = (targets - outputs).mean().detach()
+                for param in model.parameters():
+                    # print(targets, outputs)
+                    # print(delta, features, param, param.grad)
+                    # print(param.grad)
+                    if param.grad is not None:
+                        # print(param.grad, (delta.squeeze() * features))
+                        assert (param.grad == -2 * (delta.squeeze() * features)).all()
+                        param.grad.data = param.grad.data / delta.abs()
+                    # print(param.grad)
             optimizer.step()
         
         # Accumulate metrics
