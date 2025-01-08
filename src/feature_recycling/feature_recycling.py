@@ -229,7 +229,7 @@ class FeatureRecycler:
         
         # Get first layer weights and calculate l1 norms
         first_layer_weights = model.get_first_layer_weights()
-        weight_norms = torch.norm(first_layer_weights, p=1, dim=0)
+        weight_norms = torch.norm(first_layer_weights, p=1, dim=0) / first_layer_weights.shape[0]
         
         stats = {
             'avg_lifespan_real': np.mean([current_step - f.creation_step for f in real_features]) if real_features else 0,
@@ -405,6 +405,13 @@ def prepare_optimizer(model: nn.Module, cfg: DictConfig):
             lr=cfg.train.learning_rate,
             weight_decay=cfg.train.weight_decay,
         )
+    elif cfg.train.optimizer == 'sgd_momentum':
+        return optim.SGD(
+            model.parameters(),
+            lr=cfg.train.learning_rate,
+            weight_decay=cfg.train.weight_decay,
+            momentum=0.9,
+        )
     elif cfg.train.optimizer == 'idbd':
         return IDBD(
             model.parameters(),
@@ -434,6 +441,42 @@ def set_seed(seed: Optional[int]):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+def get_model_statistics(model: MLP, features: torch.Tensor, param_inputs: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    """
+    Compute statistics about the model's weights, biases, and layer inputs.
+    
+    Args:
+        model: The MLP model to analyze
+        features: Input features to compute layer activations
+        param_inputs: Dictionary mapping weight parameters to their inputs
+        
+    Returns:
+        Dictionary containing various model statistics
+    """
+    stats = {}
+    
+    # Compute statistics for each layer
+    for i, layer in enumerate(model.layers):
+        # Weight norms
+        weight_l1 = torch.norm(layer.weight, p=1).item() / layer.weight.numel()
+        stats[f'layer_{i}/weight_l1'] = weight_l1
+        
+        # Bias norms (if exists)
+        if layer.bias is not None:
+            bias_l1 = torch.norm(layer.bias, p=1).item() / layer.bias.numel()
+            stats[f'layer_{i}/bias_l1'] = bias_l1
+        
+        # Input norms
+        if i == 0:
+            input_l1 = torch.norm(features, p=1, dim=1).mean().item() / features.shape[1]
+        else:
+            layer_inputs = param_inputs[layer.weight]
+            input_l1 = torch.norm(layer_inputs, p=1, dim=1).mean().item() / layer_inputs.shape[1]
+        stats[f'layer_{i}/input_l1'] = input_l1
+    
+    return stats
 
 
 @hydra.main(config_path='conf', config_name='defaults')
@@ -503,6 +546,7 @@ def main(cfg: DictConfig) -> None:
             first_layer_weights=model.get_first_layer_weights(),
             step_num=step
         )
+        features[0, 0] = 0
 
         # Reset weights and optimizer states for recycled features
         reset_feature_weights(recycled_features, model, optimizer, cfg)
@@ -549,6 +593,8 @@ def main(cfg: DictConfig) -> None:
             }
             # Add recycler statistics
             metrics.update(recycler.get_statistics(step, model, optimizer))
+            # Add model statistics
+            metrics.update(get_model_statistics(model, features, param_inputs))
             wandb.log(metrics)
             
             pbar.set_postfix(loss=metrics['loss'], accuracy=metrics['accuracy'])
