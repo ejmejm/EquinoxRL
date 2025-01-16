@@ -148,12 +148,12 @@ class NonlinearGEOFFTask:
         
         if n_layers == 1:
             # For linear case, single layer mapping input to output
-            layer_weights = (torch.randint(0, 2, (n_features, 1)) * 2 - 1) * weight_scale
+            layer_weights = (torch.randint(0, 2, (n_features, 1)) * 2 - 1).float() * weight_scale
             self.weights.append(layer_weights)
             self.flip_accumulators.append(flip_rate * n_features)
         else:
             # Input layer
-            layer_weights = (torch.randint(0, 2, (n_features, hidden_dim)) * 2 - 1) * weight_scale
+            layer_weights = (torch.randint(0, 2, (n_features, hidden_dim)) * 2 - 1).float() * weight_scale
             self._sparsify_weights(layer_weights, sparsity)
             self.weights.append(layer_weights)
             
@@ -163,7 +163,7 @@ class NonlinearGEOFFTask:
             
             # Hidden layers
             for i in range(n_layers - 2):
-                layer_weights = (torch.randint(0, 2, (hidden_dim, hidden_dim)) * 2 - 1) * weight_scale
+                layer_weights = (torch.randint(0, 2, (hidden_dim, hidden_dim)) * 2 - 1).float() * weight_scale
                 self._sparsify_weights(layer_weights, sparsity)
                 self.weights.append(layer_weights)
                 
@@ -172,7 +172,7 @@ class NonlinearGEOFFTask:
                 self.flip_accumulators.append(flip_rate * n_flippable)
             
             # Output layer
-            output_weights = (torch.randint(0, 2, (hidden_dim, 1)) * 2 - 1) * weight_scale
+            output_weights = (torch.randint(0, 2, (hidden_dim, 1)) * 2 - 1).float() * weight_scale
             self.weights.append(output_weights)
             
             # Output layer flippable weights
@@ -212,11 +212,6 @@ class NonlinearGEOFFTask:
     def get_iterator(self, batch_size: int):
         """Returns an iterator that generates batches of data."""
         while True:
-            # Generate random input features
-            x = torch.randn(batch_size, self.n_features)
-            
-            # Forward pass through target network
-            y = self._forward(x)
             
             # Accumulate and handle weight flips
             for i in range(len(self.flip_accumulators)):
@@ -231,5 +226,11 @@ class NonlinearGEOFFTask:
                 self.flip_accumulators[i] += self.flip_rate * n_flippable
             
             self._flip_signs()
+            
+            # Generate random input features
+            x = torch.randn(batch_size, self.n_features)
+            
+            # Forward pass through target network
+            y = self._forward(x)
             
             yield x, y
