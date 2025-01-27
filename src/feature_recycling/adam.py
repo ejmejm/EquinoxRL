@@ -380,6 +380,7 @@ def _single_tensor_adam(
             step_size = lr / bias_correction1
             step_size_neg = step_size.neg()
 
+            print(bias_correction2.shape)
             bias_correction2_sqrt = bias_correction2.sqrt()
 
             if amsgrad:
@@ -411,16 +412,14 @@ def _single_tensor_adam(
 
             step_size = lr / bias_correction1
 
-            bias_correction2_sqrt = _dispatch_sqrt(bias_correction2)
-
             if amsgrad:
                 # Maintains the maximum of all 2nd moment running avg. till now
                 torch.maximum(max_exp_avg_sqs[i], exp_avg_sq, out=max_exp_avg_sqs[i])
 
                 # Use the max. for normalizing running avg. of gradient
-                denom = (max_exp_avg_sqs[i].sqrt() / bias_correction2_sqrt).add_(eps)
+                denom = (max_exp_avg_sqs[i] / bias_correction2).sqrt().add_(eps)
             else:
-                denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+                denom = (bias_correction2 / exp_avg_sq).sqrt().add_(eps)
 
             param_change = exp_avg / denom * -step_size
             param.add_(param_change)

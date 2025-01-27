@@ -14,4 +14,4 @@ task:
   hidden_dim: 20
   weight_scale: 1.0
   activation: tanh
-  sparsity: 0.0
+  sparsity: 0.00

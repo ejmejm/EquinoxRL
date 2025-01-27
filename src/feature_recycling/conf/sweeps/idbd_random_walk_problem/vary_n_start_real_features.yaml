@@ -1,0 +1,69 @@
+program: run_experiment.py
+method: grid
+project: feature_recycling-idbd_random_walk_problem
+name: vary_n_start_real_features
+
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config-name=nonlinear_geoff.yaml
+  - ${args_no_hyphens}
+
+
+metric:
+  name: cumulative_loss
+  goal: minimize
+
+
+parameters:
+  wandb:
+    value: True
+  device:
+    value: cpu
+
+  task.n_real_features:
+    value: 20
+  task.n_features:
+    value: "\"${eval:${feature_recycling.n_start_real_features} + 10}\""
+  task.flip_rate:
+    value: 0.0
+  task.weight_scale:
+    value: 0.5
+  task.n_layers:
+    value: 1
+
+  feature_recycling.use_cbp_utility:
+    value: False
+  feature_recycling.distractor_chance:
+    value: 1.0
+  feature_recycling.recycle_rate:
+    value: 0.0
+
+  train.total_steps:
+    value: 100000
+  train.log_freq:
+    value: 100
+  train.batch_size:
+    value: 1
+  train.optimizer:
+    value: idbd
+  train.learning_rate:
+    value: 0.00001
+
+  model.n_layers:
+    value: 1
+  model.weight_init_method:
+    value: zeros
+  
+  idbd.version:
+    value: 'squared_grads'
+  idbd.meta_learning_rate:
+    value: 0.1
+
+  feature_recycling.n_start_real_features:
+    values: [20, 18, 16, 14, 12, 10, 8, 6, 4, 2, 0]
+  
+  seed:
+    values: [0, 1, 2]

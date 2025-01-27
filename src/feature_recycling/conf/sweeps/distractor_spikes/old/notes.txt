@@ -1,0 +1,3 @@
+In this set of sweeps, I am looking at the phenomenon where the weights of the distractors increase instead of decrease.
+The pattern changes in these different scenarios:
+- linear, 

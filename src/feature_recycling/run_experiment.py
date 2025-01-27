@@ -20,6 +20,9 @@ from models import MLP
 from tasks import DummyTask, GEOFFTask, NonlinearGEOFFTask
 
 
+omegaconf.OmegaConf.register_new_resolver('eval', lambda x: eval(str(x)))
+
+
 @dataclass
 class FeatureInfo:
     """Stores information about a feature including its utility and distribution parameters."""
@@ -41,7 +44,9 @@ class FeatureRecycler:
         use_cbp_utility: bool,
         feature_protection_steps: int,
         sample_with_replacement: bool = False,
-        device: str = 'cuda'
+        std_normal_distractors_only: bool = False,
+        n_start_real_features: int = -1,
+        device: str = 'cuda',
     ):
         """
         Args:
@@ -52,6 +57,7 @@ class FeatureRecycler:
             utility_decay: Decay rate for feature utility
             use_cbp_utility: Whether to use CBP utility or random selection
             feature_protection_steps: Number of steps to protect new features
+            n_start_real_features: When not -1, forces the the recycler to start with exactly this many real features
             device: Device to put tensors on
         """
         self.n_features = n_features
@@ -62,6 +68,8 @@ class FeatureRecycler:
         self.use_cbp_utility = use_cbp_utility
         self.feature_protection_steps = feature_protection_steps
         self.sample_with_replacement = sample_with_replacement
+        self.std_normal_distractors_only = std_normal_distractors_only
+        self.n_start_real_features = n_start_real_features
         self.device = device
         
         self.recycle_accumulator = 0.0
@@ -71,12 +79,28 @@ class FeatureRecycler:
     
     def _initialize_features(self):
         """Initialize the initial pool of features."""
-        for i in range(self.n_features):
-            self._add_new_feature(i, 0)
+        
+        if self.n_start_real_features > 0:
+            n_real = min(self.n_start_real_features, self.n_features)
+            for i in range(n_real):
+                self._add_new_feature(i, 0, force_real=True)
+                
+            n_remaining = max(0, self.n_features - n_real)
+            for i in range(n_remaining):
+                self._add_new_feature(n_real + i, 0, force_distractor=True)
+
+        else:
+            for i in range(self.n_features):
+                self._add_new_feature(i, 0)
     
-    def _add_new_feature(self, idx: int, step: int):
+    def _add_new_feature(self, idx: int, step: int, force_real: bool = False, force_distractor: bool = False):
         """Add a new feature (real or distractor) at the given index."""
-        is_real = random.random() > self.distractor_chance
+        if force_real:
+            is_real = True
+        elif force_distractor:
+            is_real = False
+        else:
+            is_real = random.random() > self.distractor_chance
         
         # Get list of currently used feature indices
         used_indices = set([
@@ -100,7 +124,14 @@ class FeatureRecycler:
             is_real = False
             
             # 50% chance of uniform vs normal distribution
-            if random.random() < 0.5:
+            if self.std_normal_distractors_only:
+                dist_params = {
+                    'type': 'distractor',
+                    'distribution': 'normal',
+                    'mean': 0.0,
+                    'std': 1.0,
+                }
+            elif random.random() < 0.5:
                 dist_params = {
                     'type': 'distractor',
                     'distribution': 'uniform',
@@ -377,7 +408,7 @@ def prepare_task(cfg: DictConfig):
             n_features=cfg.task.n_real_features,
             flip_rate=cfg.task.flip_rate,
             n_layers=cfg.task.n_layers,
-            hidden_dim=cfg.task.hidden_dim,
+            hidden_dim=cfg.task.hidden_dim if cfg.task.n_layers > 1 else 0,
             weight_scale=cfg.task.weight_scale,
             activation=cfg.task.activation,
             sparsity=cfg.task.sparsity,
@@ -473,7 +504,7 @@ def get_model_statistics(model: MLP, features: torch.Tensor, param_inputs: Dict[
             input_l1 = torch.norm(features, p=1, dim=1).mean().item() / features.shape[1]
         else:
             layer_inputs = param_inputs[layer.weight]
-            input_l1 = torch.norm(layer_inputs, p=1, dim=1).mean().item() / layer_inputs.shape[1]
+            input_l1 = torch.norm(layer_inputs, p=1, dim=-1).mean().item() / layer_inputs.shape[-1]
         stats[f'layer_{i}/input_l1'] = input_l1
     
     return stats
@@ -490,7 +521,7 @@ def main(cfg: DictConfig) -> None:
     # Initialize wandb
     wandb_config = omegaconf.OmegaConf.to_container(
         cfg, resolve=True, throw_on_missing=True)
-    wandb.init(project=cfg.project, config=wandb_config)
+    wandb.init(project=cfg.project, config=wandb_config, allow_val_change=True)
     
     task = prepare_task(cfg)
     task_iterator = task.get_iterator(cfg.train.batch_size)
@@ -506,7 +537,7 @@ def main(cfg: DictConfig) -> None:
         device=cfg.device
     ).to(cfg.device)
     
-    criterion = (nn.CrossEntropyLoss() if cfg.task.type == 'classification' 
+    criterion = (nn.CrossEntropyLoss() if cfg.task.type == 'classification'
                 else nn.MSELoss())
     optimizer = prepare_optimizer(model, cfg)
     
@@ -519,6 +550,7 @@ def main(cfg: DictConfig) -> None:
         utility_decay=cfg.feature_recycling.utility_decay,
         use_cbp_utility=cfg.feature_recycling.use_cbp_utility,
         feature_protection_steps=cfg.feature_recycling.feature_protection_steps,
+        n_start_real_features=cfg.feature_recycling.get('n_start_real_features', -1),
         device=cfg.device,
     )
     
@@ -546,7 +578,6 @@ def main(cfg: DictConfig) -> None:
             first_layer_weights=model.get_first_layer_weights(),
             step_num=step
         )
-        features[0, 0] = 0
 
         # Reset weights and optimizer states for recycled features
         reset_feature_weights(recycled_features, model, optimizer, cfg)
@@ -610,7 +641,6 @@ def main(cfg: DictConfig) -> None:
     
     pbar.close()
     wandb.finish()
-
 
 if __name__ == '__main__':
     main()

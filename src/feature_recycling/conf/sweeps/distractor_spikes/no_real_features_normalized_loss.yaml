@@ -1,0 +1,32 @@
+program: scripts/distractor_spikes_experiment.py
+method: grid
+project: feature-recycling_distractor-spikes
+name: no_real_features_normalized_loss
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config-name=distractor_spikes.yaml
+  - ${args_no_hyphens}
+
+metric:
+  name: cumulative_loss
+  goal: minimize
+
+parameters:
+  wandb:
+    value: true
+  device:
+    value: cpu
+
+  task.n_features:
+    value: 1
+  feature_recycling.distractor_chance:
+    value: 1.0
+
+  train.normalize_loss:
+    values: [true, false]
+
+  seed:
+    values: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]

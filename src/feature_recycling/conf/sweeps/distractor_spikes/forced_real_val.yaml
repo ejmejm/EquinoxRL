@@ -1,0 +1,30 @@
+program: scripts/distractor_spikes_experiment.py
+method: grid
+project: feature-recycling_distractor-spikes
+name: forced_real_val
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config-name=distractor_spikes.yaml
+  - ${args_no_hyphens}
+
+metric:
+  name: cumulative_loss
+  goal: minimize
+
+parameters:
+  wandb:
+    value: true
+  device:
+    value: cpu
+
+  train.normalize_loss:
+    value: true
+  
+  train.force_real_weight_val:
+    values: [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]
+
+  seed:
+    values: [0, 1, 2, 3, 4]

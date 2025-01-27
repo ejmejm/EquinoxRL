@@ -1,4 +1,4 @@
-python feature_recycling.py --config-name=nonlinear_geoff.yaml \
+python run_experiment.py --config-name=nonlinear_geoff.yaml \
 device=cpu \
 seed=0 \
 \

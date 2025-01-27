@@ -17,7 +17,7 @@ class MLP(nn.Module):
         n_layers: int,
         hidden_dim: int,
         weight_init_method: str,
-        activation: str = 'relu',
+        activation: str = 'tanh',
         device: str = 'cuda'
     ):
         """

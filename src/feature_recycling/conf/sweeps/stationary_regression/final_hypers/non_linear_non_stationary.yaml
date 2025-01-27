@@ -1,0 +1,70 @@
+program: scripts/run_with_weight_log.py
+method: grid
+project: feature_recycling-stationary_regression-final_hypers
+name: non_linear_non_stationary
+
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config-name=nonlinear_geoff.yaml
+  - ${args_no_hyphens}
+
+
+metric:
+  name: cumulative_loss
+  goal: minimize
+
+
+parameters:
+  wandb:
+    value: True
+  device:
+    value: cpu
+
+  task.n_real_features:
+    value: 4
+  task.n_features:
+    value: 5
+  task.weight_scale:
+    value: 1.0
+  task.n_layers:
+    value: 2
+  task.hidden_dim:
+    value: 8
+
+  feature_recycling.use_cbp_utility:
+    value: False
+  feature_recycling.distractor_chance:
+    value: 0.0
+  feature_recycling.recycle_rate:
+    value: 0.0
+
+  train.total_steps:
+    value: 100000
+  train.log_freq:
+    value: 50
+  train.batch_size:
+    value: 1
+  train.optimizer:
+    value: idbd
+  train.learning_rate:
+    value: 0.00001
+
+  model.n_layers:
+    value: 2
+  model.hidden_dim:
+    value: 2
+  model.weight_init_method:
+    value: zeros
+  
+  idbd.version:
+    value: 'squared_grads'
+  idbd.meta_learning_rate:
+    value: 0.01
+
+  task.flip_rate:
+    values: [0.0, 0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005]
+  seed:
+    values: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]

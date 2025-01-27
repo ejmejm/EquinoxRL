@@ -46,7 +46,13 @@ class IDBD(Optimizer):
     
 
     @torch.no_grad()
-    def step(self, loss: torch.Tensor, predictions: torch.Tensor, param_inputs: Dict[torch.nn.parameter.Parameter, torch.Tensor], closure: Optional[callable] = None) -> Optional[float]:
+    def step(
+        self,
+        loss: torch.Tensor,
+        predictions: torch.Tensor,
+        param_inputs: Dict[torch.nn.parameter.Parameter, torch.Tensor],
+        closure: Optional[callable] = None,
+    ) -> Optional[float]:
         """Performs a single optimization step.
         
         Args:

@@ -1,4 +1,4 @@
-python feature_recycling.py --config-name=nonlinear_geoff.yaml \
+python run_experiment.py --config-name=nonlinear_geoff.yaml \
 device=cpu \
 seed=0 \
 \
@@ -27,7 +27,6 @@ model.hidden_dim=128 \
 model.weight_init_method=zeros \
 \
 idbd.meta_learning_rate=0.1 \
-idbd.diagonal_approx=false \
 \
 wandb=false
 

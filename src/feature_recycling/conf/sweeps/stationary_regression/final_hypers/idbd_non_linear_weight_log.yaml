@@ -1,0 +1,70 @@
+program: scripts/run_with_weight_log.py
+method: grid
+project: feature_recycling-stationary_regression-final_hypers
+name: idbd_non_linear_weight_log
+
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config-name=nonlinear_geoff.yaml
+  - ${args_no_hyphens}
+
+
+metric:
+  name: cumulative_loss
+  goal: minimize
+
+
+parameters:
+  wandb:
+    value: True
+  device:
+    value: cpu
+
+  task.n_real_features:
+    value: 1
+  task.n_features:
+    value: 2
+  task.flip_rate:
+    value: 0.0
+  task.weight_scale:
+    value: 1.0
+  task.n_layers:
+    value: 2
+  task.hidden_dim:
+    value: 5
+
+  feature_recycling.use_cbp_utility:
+    value: False
+  feature_recycling.distractor_chance:
+    value: 0.0
+  feature_recycling.recycle_rate:
+    value: 0.0
+
+  train.total_steps:
+    value: 100000
+  train.log_freq:
+    value: 100
+  train.batch_size:
+    value: 1
+  train.optimizer:
+    value: idbd
+  train.learning_rate:
+    value: 0.00001
+
+  model.n_layers:
+    value: 2
+  model.hidden_dim:
+    value: 2
+  model.weight_init_method:
+    value: kaiming_uniform
+  
+  idbd.version:
+    value: 'squared_grads'
+  idbd.meta_learning_rate:
+    value: 0.5
+
+  seed:
+    values: [0, 1, 2, 3, 4]

@@ -1,0 +1,70 @@
+program: run_experiment.py
+method: grid
+project: feature_recycling-stationary_regression-final_hypers
+name: non_linear_smaller_agent_distractor_inspection
+
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config-name=nonlinear_geoff.yaml
+  - ${args_no_hyphens}
+
+
+metric:
+  name: cumulative_loss
+  goal: minimize
+
+
+parameters:
+  wandb:
+    value: True
+  device:
+    value: cpu
+
+  task.n_real_features:
+    value: 4
+  task.n_features:
+    value: 5
+  task.flip_rate:
+    value: 0.0
+  task.weight_scale:
+    value: 1.0
+  task.n_layers:
+    value: 2
+  task.hidden_dim:
+    value: 2
+
+  feature_recycling.use_cbp_utility:
+    value: False
+  feature_recycling.distractor_chance:
+    value: 0.0
+  feature_recycling.recycle_rate:
+    value: 0.0
+
+  train.total_steps:
+    value: 100000
+  train.log_freq:
+    value: 100
+  train.batch_size:
+    value: 1
+  train.optimizer:
+    value: sgd
+  train.learning_rate:
+    value: 0.004
+
+  model.n_layers:
+    value: 2
+  model.hidden_dim:
+    value: 8
+  model.weight_init_method:
+    value: zeros
+  
+  idbd.version:
+    value: 'squared_grads'
+  idbd.meta_learning_rate:
+    value: 0.5
+
+  seed:
+    values: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]

@@ -1,0 +1,34 @@
+program: scripts/distractor_spikes_experiment.py
+method: grid
+project: feature-recycling_distractor-spikes
+name: normalized_loss
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config-name=distractor_spikes.yaml
+  - ${args_no_hyphens}
+
+metric:
+  name: cumulative_loss
+  goal: minimize
+
+parameters:
+  wandb:
+    value: true
+  device:
+    value: cpu
+
+  train.normalize_loss:
+    value: false
+
+  train.optimizer:
+    value: idbd
+  idbd.meta_learning_rate:
+    value: 0.001
+  idbd.version:
+    value: squared_grads
+
+  seed:
+    values: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]

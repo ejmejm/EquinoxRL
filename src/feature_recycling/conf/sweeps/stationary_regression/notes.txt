@@ -1,0 +1,7 @@
+Purpose:
+Before we worry about whether our future IDBD variant can correctly optimize step-sizes for non-stationary problems, we should first show that it can do about as well as Adam
+on simple, stationary linear regression problems.
+In these sweeps, we test the performance of SGD, RMSProp, Adam, and SGD w/ momentum on the static, linear, no-distractor GEOFF task (e.g. supervised regression) with a non-linear prediction network.
+
+Results:
+...
